@@ -57,11 +57,27 @@
 #   video-format: I420
 #   camera-v4l2-dev-node: 1
 #   cudadec-memtype: 0
+v4l2-rgbtsrc:
+  enable: 1
+  device0: /dev/video0
+  device1: /dev/video1
+  camera-width: 1920
+  camera-height: 1080
+  camera-fps-n: 30
+  camera-fps-d: 1
+  video-format: I420
 
 source-list:
   # semicolon separated uri. For ex- uri1;uri2;uriN;
   # list: file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4;
+  # 0: MultiURI 1: CameraV4l2
+  type: 0
   list: file:/workspace/datasets/vi.mp4;file:/workspace/datasets/ir.mp4;
+  # camera-v4l2-dev-node: /dev/video0;dev/video1;
+  # camera-width: 1920
+  # camera-height: 1080
+  # camera-fps-n: 30
+  # camera-fps-d: 1
 
 streammux:
   gpu-id: 0
