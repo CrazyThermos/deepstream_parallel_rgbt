@@ -114,6 +114,20 @@ gint frame_number = 0, frame_count = 0;
   } \
 } while (0)
 
+
+typedef struct
+{
+  gboolean enable;
+  gboolean loop;
+  gboolean live_source;
+  gint camera_width;
+  gint camera_height;
+  std::string camera_fps_n;
+  std::string camera_fps_d;
+  std::string device_node;
+  std::string video_format;
+} v4l2Config;
+
 /* tiler_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
  * and update params for drawing rectangle, object information etc. */
 static GstPadProbeReturn
@@ -211,6 +225,7 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           cv::Mat dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
           obj_meta->rect_params.width, obj_meta->rect_params.height));
           // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
+          if(dstROI.empty()) continue;
           cv::GaussianBlur(dstROI, dstROI, cv::Size(3, 3), 0);
           // cv::Mat edges;
           // cv::Canny(dstROI, edges, 100, 255, 3, false);
@@ -874,7 +889,7 @@ decodebin_child_added (GstChildProxy * child_proxy, GObject * object,
 }
 
 static GstElement *
-create_source_bin (guint index, gchar * uri)
+create_filesource_bin (guint index, gchar * uri)
 {
   GstElement *bin = NULL, *uri_decode_bin = NULL;
   gchar bin_name[16] = { };
@@ -911,6 +926,98 @@ create_source_bin (guint index, gchar * uri)
       G_CALLBACK (decodebin_child_added), bin);
 
   gst_bin_add (GST_BIN (bin), uri_decode_bin);
+
+  /* We need to create a ghost pad for the source bin which will act as a proxy
+   * for the video decoder src pad. The ghost pad will not have a target right
+   * now. Once the decode bin creates the video decoder and generates the
+   * cb_newpad callback, we will set the ghost pad target to the video decoder
+   * src pad. */
+  if (!gst_element_add_pad (bin, gst_ghost_pad_new_no_target ("src",
+              GST_PAD_SRC))) {
+    g_printerr ("Failed to add ghost pad in source bin\n");
+    return NULL;
+  }
+
+  return bin;
+}
+
+
+static GstElement *
+create_v4l2source_bin (const v4l2Config &config, gint index)
+{
+  GstElement *bin = NULL, *cap_filter = NULL,*cap_filter1 = NULL, *src_elem = NULL;
+  GstCaps * caps, * caps1;
+  gchar bin_name[16] = { };
+
+  g_snprintf (bin_name, 15, "source-bin-%02d", index);
+  /* Create a source GstBin to abstract this bin's content from the rest of the
+   * pipeline */
+  bin = gst_bin_new (bin_name);
+
+  src_elem =
+      gst_element_factory_make (NVDS_ELEM_SRC_CAMERA_V4L2, "src_elem");
+  cap_filter1 =
+      gst_element_factory_make (NVDS_ELEM_CAPS_FILTER, "src_cap_filter1");
+  if (!cap_filter1) {
+    NVGSTDS_ERR_MSG_V ("Could not create 'src_cap_filter1'");
+    // goto done;
+  }
+  caps1 = gst_caps_new_simple ("video/x-raw",
+      "width", G_TYPE_INT, config.camera_width, "height", G_TYPE_INT,
+      config.camera_height, "framerate", GST_TYPE_FRACTION,
+      config.camera_fps_n, config.camera_fps_d, NULL);
+  cap_filter =
+      gst_element_factory_make (NVDS_ELEM_CAPS_FILTER, "src_cap_filter");
+
+  caps = gst_caps_new_simple ("video/x-raw", "format", G_TYPE_STRING,
+            config.video_format, "width", G_TYPE_INT, config.camera_width,
+            "height", G_TYPE_INT, config.camera_height, "framerate",
+            GST_TYPE_FRACTION, config.camera_fps_n, config.camera_fps_d,
+            NULL);
+  GstElement *nvvidconv2;
+  GstCapsFeatures *feature = NULL;
+  //Check based on igpu/dgpu instead of x86/aarch64
+  GstElement *nvvidconv1 = NULL;
+
+  nvvidconv1 = gst_element_factory_make ("videoconvert", "nvvidconv1");
+  if (!nvvidconv1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create 'nvvidconv1'");
+  }
+
+  gchar device[64];
+
+  g_snprintf (device, sizeof (device), "/dev/video%d",
+      config.device_node.c_str());
+  g_object_set (G_OBJECT (src_elem), "device", device, NULL);
+
+  GST_CAT_DEBUG (NVDS_APP, "Setting v4l2 camera params successful");
+  /* Source element for reading from the uri.
+   * We will use decodebin and let it figure out the container format of the
+   * stream and the codec and plug the appropriate demux and decode plugins. */
+  // if (PERF_MODE) {
+  //   uri_decode_bin = gst_element_factory_make ("nvurisrcbin", "uri-decode-bin");
+  //   g_object_set (G_OBJECT (uri_decode_bin), "file-loop", TRUE, NULL);
+  //   g_object_set (G_OBJECT (uri_decode_bin), "cudadec-memtype", 0, NULL);
+  // } else {
+  //   uri_decode_bin = gst_element_factory_make ("uridecodebin", "uri-decode-bin");
+  // }
+
+  // if (!bin || !uri_decode_bin) {
+  //   g_printerr ("One element in source bin could not be created.\n");
+  //   return NULL;
+  // }
+
+  /* We set the input uri to the source element */
+  // g_object_set (G_OBJECT (uri_decode_bin), "uri", uri, NULL);
+
+  /* Connect to the "pad-added" signal of the decodebin which generates a
+   * callback once a new pad for raw data has beed created by the decodebin */
+  // g_signal_connect (G_OBJECT (uri_decode_bin), "pad-added",
+  //     G_CALLBACK (cb_newpad), bin);
+  // g_signal_connect (G_OBJECT (uri_decode_bin), "child-added",
+  //     G_CALLBACK (decodebin_child_added), bin);
+
+  // gst_bin_add (GST_BIN (bin), uri_decode_bin);
 
   /* We need to create a ghost pad for the source bin which will act as a proxy
    * for the video decoder src pad. The ghost pad will not have a target right
@@ -1019,6 +1126,71 @@ done:
   return abs_path;
 }
 
+
+std::string get_plugin_key(const std::string name, const std::string key, gchar* cfg_file_path)
+{
+  gboolean find = FALSE;
+  std::string res;
+  YAML::Node configyml = YAML::LoadFile(cfg_file_path);
+  for(YAML::const_iterator itr = configyml[name].begin();
+     itr != configyml[name].end(); ++itr)
+  {
+    const std::string paramKey = itr->first.as<std::string>();
+    if (paramKey == key) {
+      find = TRUE;
+      res =  itr->second.as<std::string>();
+      break;
+    } 
+  }
+  if(!find) {
+    g_printerr("[WARNING] Can't found param in plugin:(%s)", key.c_str());
+  }
+  return res;
+}
+
+gboolean parse_v4l2src_yaml(v4l2Config &config, const std::string name, gchar* cfg_file_path)
+{
+
+
+    //       = std::stoul(get_plugin_key("v4l2-rgbtsrc", "enable", argv[1]));
+    //   = get_plugin_key("v4l2-rgbtsrc", "device0", argv[1]);
+    //   = std::stoi(get_plugin_key("v4l2-rgbtsrc", "camera-width", argv[1]));
+    // v4l2config0.camera_height = std::stoi(get_plugin_key("v4l2-rgbtsrc", "camera-height", argv[1]));
+    //   = std::stoi(get_plugin_key("v4l2-rgbtsrc", "camera-fps-n", argv[1]));
+    //   = std::stoi(get_plugin_key("v4l2-rgbtsrc", "camera-fps-d", argv[1]));
+    //   =  get_plugin_key("v4l2-rgbtsrc", "video-format", argv[1]);
+  // gboolean find = FALSE;
+
+  YAML::Node configyml = YAML::LoadFile(cfg_file_path);
+  for(YAML::const_iterator itr = configyml[name].begin();
+     itr != configyml[name].end(); ++itr)
+  {
+    const std::string paramKey = itr->first.as<std::string>();
+    if (paramKey == "enable") {
+      config.enable =  itr->second.as<bool>();
+    } 
+    else if (paramKey == "device-node") {
+      config.device_node =  itr->second.as<std::string>();
+    } 
+    else if (paramKey == "camera-width") {
+      config.camera_width =  itr->second.as<int>();
+    } 
+    else if (paramKey == "camera-height") {
+      config.camera_height =  itr->second.as<int>();
+    } 
+    else if (paramKey == "camera-fps-n") {
+      config.camera_fps_n =  itr->second.as<int>();
+    } 
+    else if (paramKey == "camera-fps-d") {
+      config.camera_fps_d =  itr->second.as<int>();
+    } 
+    else if (paramKey == "video-format") {
+      config.video_format =  itr->second.as<std::string>();
+    } 
+  }
+
+  return true;
+}
 
 gboolean
 link_element_to_metamux_sink_pad (GstElement *metamux, GstElement *elem,
@@ -1163,10 +1335,24 @@ main (int argc, char *argv[])
   gst_bin_add (GST_BIN (pipeline), streammux);
 
   GList *src_list = NULL ;
+  int type = 0;
+  v4l2Config v4l2config[2];
+  // v4l2Config v4l2config1;
 
+  // gboolean v4l2enable;
+  // std::string device_node0;
+  // std::string device_node1;
+  // int camera_width;
+  // int camera_height;
+  // int camera_fps_n;
+  // int camera_fps_d;
+  // std::string video_format;
+  
   if (yaml_config) {
-
+    // RETURN_ON_PARSER_ERROR(nvds_parse_v4l2src(element,argv[1],"v4l2src"));
     RETURN_ON_PARSER_ERROR(nvds_parse_source_list(&src_list, argv[1], "source-list"));
+    parse_v4l2src_yaml(v4l2config[0], "", argv[1]);
+    parse_v4l2src_yaml(v4l2config[1], "", argv[1]);
 
     GList * temp = src_list;
     while(temp) {
@@ -1183,11 +1369,13 @@ main (int argc, char *argv[])
     gchar pad_name[16] = { };
 
     GstElement *source_bin= NULL;
-    if (g_str_has_suffix (argv[1], ".yml") || g_str_has_suffix (argv[1], ".yaml")) {
+    if (!v4l2config[0].enable && !v4l2config[1].enable) {
+    // if (g_str_has_suffix (argv[1], ".yml") || g_str_has_suffix (argv[1], ".yaml")) {
+
       g_print("Now playing : %s\n",(char*)(src_list)->data);
-      source_bin = create_source_bin (i, (char*)(src_list)->data);
+      source_bin = create_filesource_bin (i, (char*)(src_list)->data);
     } else {
-      source_bin = create_source_bin (i, argv[i + 1]);
+      source_bin = create_v4l2source_bin (v4l2config[i], i);
     }
     if (!source_bin) {
       g_printerr ("Failed to create source bin. Exiting.\n");
