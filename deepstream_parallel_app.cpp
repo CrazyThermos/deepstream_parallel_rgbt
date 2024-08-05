@@ -114,12 +114,16 @@ gint frame_number = 0, frame_count = 0;
   } \
 } while (0)
 
+#define DEBUG_STAGE 0
 /* tiler_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
  * and update params for drawing rectangle, object information etc. */
 static GstPadProbeReturn
 tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
     gpointer u_data)
 {
+  if (DEBUG_STAGE){
+    g_print("tiler_src_pad_buffer_probe start");
+  }
   GstBuffer *buf = (GstBuffer *) info->data;
   guint num_rects = 0; 
   NvDsObjectMeta *obj_meta = NULL;
@@ -145,7 +149,9 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
   for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
     l_frame = l_frame->next) {
       NvDsFrameMeta *frame_meta = (NvDsFrameMeta *) (l_frame->data);
-
+    if (DEBUG_STAGE){
+      g_print("create surface\n");
+    }
       //TODO for cuda device memory we need to use cudamemcpy
       NvBufSurfaceMap (surface, -1, -1, NVBUF_MAP_READ);
       /* Cache the mapped data for CPU access */
@@ -207,7 +213,7 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
             obj_meta->rect_params.border_color.blue = 1.0;
             obj_meta->rect_params.border_color.alpha = 0.5;
           }
-          if(obj_meta->rect_params.left > 1024.0) continue;
+          if(obj_meta->rect_params.left > surface_width/2) continue;
           cv::Mat dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
           obj_meta->rect_params.width, obj_meta->rect_params.height));
           // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
@@ -235,6 +241,7 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           num_rects++;
       }
       // gray.copyTo(trans_mat);
+      if(!DEBUG_STAGE)
       g_print ("TILER: Frame Number = %d Number of objects = %d\n", frame_meta->frame_num, num_rects);
 
 #if 0
@@ -307,6 +314,9 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 #endif
 
 #if 1
+    if (DEBUG_STAGE){
+      g_print("get output tensor\n");
+    }
     NvDsUserMetaList *usrMetaList = frame_meta->frame_user_meta_list;
     if (usrMetaList != NULL) {
       NvDsUserMeta *usrMetaData = (NvDsUserMeta *) usrMetaList->data;
@@ -338,7 +348,7 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
             uint8Buffer[o_index] = static_cast<uint8_t>(std::min(std::max(outputCoverageBuffer[o_index] * 255.0f, 0.0f), 255.0f));
           }
           fusion_mat = cv::Mat(fusion_height, fusion_width, image_format, uint8Buffer, fusion_width);
-          cv::resize(fusion_mat, fusion_mat,cv::Size(1024,768));
+          cv::resize(fusion_mat, fusion_mat,cv::Size(surface_width/2,surface_height/2));
           // char file_name[128];
           // sprintf(file_name, "resize_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
           // cv::imwrite(file_name, fusion_mat);
@@ -376,57 +386,64 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           // cv::imwrite(file_name, gray);
 
         }
+      }
+    if (DEBUG_STAGE){
+      g_print("NvBufSurfTransformRect\n");
     }
+      gray.copyTo(trans_mat);
+      NvBufSurfaceSyncForDevice(inter_buf, -1, -1);
+      inter_buf->numFilled = 1;
+      NvBufSurfTransformConfigParams transform_config_params;
+      NvBufSurfTransformParams transform_params;
+      NvBufSurfTransformRect src_rect;
+      NvBufSurfTransformRect dst_rect;
+      cudaStream_t cuda_stream;
+      CHECK_CUDA_STATUS (cudaStreamCreate (&cuda_stream),
+        "Could not create cuda stream");
+      // transform_config_params.input_buf_count = 2;
+      // transform_config_params.composite_flag = NVBUFSURF_TRANSFORM_COMPOSITE;
 
-    gray.copyTo(trans_mat);
-    NvBufSurfaceSyncForDevice(inter_buf, -1, -1);
-    inter_buf->numFilled = 1;
-    NvBufSurfTransformConfigParams transform_config_params;
-    NvBufSurfTransformParams transform_params;
-    NvBufSurfTransformRect src_rect;
-    NvBufSurfTransformRect dst_rect;
-    cudaStream_t cuda_stream;
-    CHECK_CUDA_STATUS (cudaStreamCreate (&cuda_stream),
-      "Could not create cuda stream");
-    // transform_config_params.input_buf_count = 2;
-    // transform_config_params.composite_flag = NVBUFSURF_TRANSFORM_COMPOSITE;
+      transform_config_params.compute_mode = NvBufSurfTransformCompute_Default;
+      transform_config_params.gpu_id = surface->gpuId;
+      transform_config_params.cuda_stream = cuda_stream;
+      /* Set the transform session parameters for the conversions executed in this
+        * thread. */
+      NvBufSurfTransform_Error err = NvBufSurfTransformSetSessionParams (&transform_config_params);
+      if (err != NvBufSurfTransformError_Success) {
+        std::cout <<"NvBufSurfTransformSetSessionParams failed with error "<< err << std::endl;
+        return GST_PAD_PROBE_OK;
+      }
+      /* Set the transform ROIs for source and destination, only do the color format conversion*/
+      src_rect = {0, 0, surface_width, surface_height };
+      dst_rect = {0, 0, surface_width, surface_height};
 
-    transform_config_params.compute_mode = NvBufSurfTransformCompute_Default;
-    transform_config_params.gpu_id = surface->gpuId;
-    transform_config_params.cuda_stream = cuda_stream;
-    /* Set the transform session parameters for the conversions executed in this
-      * thread. */
-    NvBufSurfTransform_Error err = NvBufSurfTransformSetSessionParams (&transform_config_params);
-    if (err != NvBufSurfTransformError_Success) {
-      std::cout <<"NvBufSurfTransformSetSessionParams failed with error "<< err << std::endl;
-      return GST_PAD_PROBE_OK;
-    }
-    /* Set the transform ROIs for source and destination, only do the color format conversion*/
-    src_rect = {0, 0, surface_width, surface_height };
-    dst_rect = {0, 0, surface_width, surface_height};
+      /* Set the transform parameters */
+      transform_params.src_rect = &src_rect;
+      transform_params.dst_rect = &dst_rect;
+      transform_params.transform_flag =
+        NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
+          NVBUFSURF_TRANSFORM_CROP_DST;
+      transform_params.transform_filter = NvBufSurfTransformInter_Default;
 
-    /* Set the transform parameters */
-    transform_params.src_rect = &src_rect;
-    transform_params.dst_rect = &dst_rect;
-    transform_params.transform_flag =
-      NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
-        NVBUFSURF_TRANSFORM_CROP_DST;
-    transform_params.transform_filter = NvBufSurfTransformInter_Default;
+      /* Transformation format conversion, Transform rotated RGBA mat to NV12 memory in original input surface*/
+      err = NvBufSurfTransform (inter_buf, surface, &transform_params);
+      if (err != NvBufSurfTransformError_Success) {
+        std::cout<< "NvBufSurfTransform failed with error %d while converting buffer" << err <<std::endl;
+        return GST_PAD_PROBE_OK;
+      }
 
-    /* Transformation format conversion, Transform rotated RGBA mat to NV12 memory in original input surface*/
-    err = NvBufSurfTransform (inter_buf, surface, &transform_params);
-    if (err != NvBufSurfTransformError_Success) {
-      std::cout<< "NvBufSurfTransform failed with error %d while converting buffer" << err <<std::endl;
-      return GST_PAD_PROBE_OK;
-    }
+
     // nvds_copy_obj_meta();
+    cudaStreamDestroy(cuda_stream);
     NvBufSurfaceUnMap(inter_buf, 0, 0);
     NvBufSurfaceDestroy(inter_buf);
-    cudaStreamDestroy(cuda_stream);
     NvBufSurfaceUnMap(surface, 0, 0);
     gst_buffer_unmap(buf, &in_map_info);
 #endif 
 
+  }
+  if (DEBUG_STAGE){
+    g_print("tiler_src_pad_buffer_probe end\n");
   }
   frame_number++;
   return GST_PAD_PROBE_OK;
@@ -595,12 +612,12 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 #endif
         }
         else{
-          if (temp_ptr!=NULL)
+          if (temp_ptr!=NULL&& ((NvDsFrameMeta *)(l_frame->data))->obj_meta_list!=NULL)
           nvds_copy_obj_meta_list(temp_ptr, (NvDsFrameMeta *)(l_frame->data));
 
         }
-
-          g_print ("PGIE: Frame Number = %d Number of objects = %d "
+      if(!DEBUG_STAGE)
+        g_print ("PGIE: Frame Number = %d Number of objects = %d "
             "Vehicle Count = %d Person Count = %d\n",
             frame_meta->frame_num, num_rects, vehicle_count, person_count);
 // #if 1
@@ -874,9 +891,113 @@ decodebin_child_added (GstChildProxy * child_proxy, GObject * object,
 }
 
 static GstElement *
+create_http_bin (guint index, gchar * uri)
+{
+  GstElement *bin = NULL, *decode_bin = NULL, *souphttpsrc = NULL, *srctee=NULL, *srcqueue=NULL, *nvvidconv = NULL, * cap_filter = NULL, * cap_filter1 = NULL;
+  GstCaps *caps = NULL;
+  GstCapsFeatures *feature = NULL;
+  gchar bin_name[16] = { };
+
+  g_snprintf (bin_name, 15, "source-bin-%02d", index);
+  /* Create a source GstBin to abstract this bin's content from the rest of the
+   * pipeline */
+  bin = gst_bin_new (bin_name);
+
+  /* Source element for reading from the uri.
+   * We will use decodebin and let it figure out the container format of the
+   * stream and the codec and plug the appropriate demux and decode plugins. */
+  // if (PERF_MODE) {
+  //   uri_decode_bin = gst_element_factory_make ("nvurisrcbin", "uri-decode-bin");
+  //   g_object_set (G_OBJECT (uri_decode_bin), "file-loop", TRUE, NULL);
+  //   g_object_set (G_OBJECT (uri_decode_bin), "cudadec-memtype", 0, NULL);
+  // } else {
+  //   uri_decode_bin = gst_element_factory_make ("uridecodebin", "uri-decode-bin");
+  // }
+  souphttpsrc = gst_element_factory_make("souphttpsrc","soup-http-src");
+  if (!bin || !souphttpsrc) {
+    g_printerr ("One element in source bin could not be created.\n");
+    return NULL;
+  }
+  // g_signal_connect (G_OBJECT (souphttpsrc), "pad-added",
+  //     G_CALLBACK (cb_newpad), bin);
+  g_object_set (G_OBJECT (souphttpsrc), "location", uri, NULL);
+  g_object_set (G_OBJECT (souphttpsrc), "is-live", true, NULL);
+  g_object_set (G_OBJECT (souphttpsrc), "timeout", 5, NULL);
+  g_object_set (G_OBJECT (souphttpsrc), "retry", 2, NULL);
+
+
+
+  srctee = gst_element_factory_make ("tee", "srctee");
+  if (!srctee) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srctee");
+    return NULL;
+  }
+
+  srcqueue = gst_element_factory_make ("queue", "srcqueue");
+  if (!srcqueue) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srcqueue");
+    return NULL;
+  }
+
+  decode_bin = gst_element_factory_make ("decodebin", "decode-bin");
+  if (!decode_bin) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "decode-bin");
+    return NULL;
+  }
+
+  /* Connect to the "pad-added" signal of the decodebin which generates a
+   * callback once a new pad for raw data has beed created by the decodebin */
+  g_signal_connect (G_OBJECT (decode_bin), "pad-added",
+      G_CALLBACK (cb_newpad), bin);
+  g_signal_connect (G_OBJECT (decode_bin), "child-added",
+      G_CALLBACK (decodebin_child_added), bin);
+
+
+  cap_filter = gst_element_factory_make ("queue", "cap_filter");
+  if (!cap_filter) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter");
+    return NULL;
+  }
+
+
+  nvvidconv = gst_element_factory_make ("nvvideoconvert", "nvvidconv");
+  if (!nvvidconv) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "nvvidconv");
+    return NULL;
+  }
+  caps = gst_caps_new_empty_simple("video/x-raw");
+  feature = gst_caps_features_new("memory:NVMM", NULL);
+  gst_caps_set_features(caps, 0, feature);
+
+
+  cap_filter1 = gst_element_factory_make ("capsfilter", "cap_filter1_nvvidconv");
+  if (!cap_filter1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter1");
+    return NULL;
+  }
+  g_object_set(G_OBJECT(cap_filter1), "caps", caps, NULL);
+  gst_caps_unref(caps);
+
+  gst_bin_add_many (GST_BIN (bin), souphttpsrc, srctee, srcqueue, decode_bin, cap_filter, nvvidconv, cap_filter1, NULL);
+  gst_element_link_many(souphttpsrc, srctee, srcqueue, decode_bin, cap_filter, nvvidconv, cap_filter1, NULL);
+  /* We need to create a ghost pad for the source bin which will act as a proxy
+   * for the video decoder src pad. The ghost pad will not have a target right
+   * now. Once the decode bin creates the video decoder and generates the
+   * cb_newpad callback, we will set the ghost pad target to the video decoder
+   * src pad. */
+  if (!gst_element_add_pad (bin, gst_ghost_pad_new_no_target ("src",
+              GST_PAD_SRC))) {
+    g_printerr ("Failed to add ghost pad in source bin\n");
+    return NULL;
+  }
+
+  return bin;
+}
+
+static GstElement *
 create_source_bin (guint index, gchar * uri)
 {
-  GstElement *bin = NULL, *uri_decode_bin = NULL;
+  GstElement *bin = NULL, *uri_decode_bin = NULL, *souphttpsrc=NULL;
   gchar bin_name[16] = { };
 
   g_snprintf (bin_name, 15, "source-bin-%02d", index);
@@ -894,7 +1015,7 @@ create_source_bin (guint index, gchar * uri)
   } else {
     uri_decode_bin = gst_element_factory_make ("uridecodebin", "uri-decode-bin");
   }
-
+  souphttpsrc = gst_element_factory_make("souphttpsrc","soup-http-src");
   if (!bin || !uri_decode_bin) {
     g_printerr ("One element in source bin could not be created.\n");
     return NULL;
@@ -1184,8 +1305,12 @@ main (int argc, char *argv[])
 
     GstElement *source_bin= NULL;
     if (g_str_has_suffix (argv[1], ".yml") || g_str_has_suffix (argv[1], ".yaml")) {
-      g_print("Now playing : %s\n",(char*)(src_list)->data);
-      source_bin = create_source_bin (i, (char*)(src_list)->data);
+      char * uri = (char*)(src_list)->data;
+      g_print("Now playing : %s\n", uri);
+      if(uri[0] =='h' && uri[1] =='t' && uri[2] =='t' && uri[3] =='p'){
+           source_bin = create_http_bin (i, uri);
+      }
+      else source_bin = create_source_bin (i, uri);
     } else {
       source_bin = create_source_bin (i, argv[i + 1]);
     }

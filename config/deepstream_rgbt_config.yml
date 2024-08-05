@@ -61,7 +61,11 @@
 source-list:
   # semicolon separated uri. For ex- uri1;uri2;uriN;
   # list: file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4;
-  list: file:/workspace/datasets/vi.mp4;file:/workspace/datasets/ir.mp4;
+  # list: file:/workspace/datasets/vi.mp4;file:/workspace/datasets/ir.mp4;
+  # list: rtsp://192.168.1.106:18554/vi;rtsp://192.168.1.106:28554/ir;
+  list: http://192.168.1.167/2.ts;http://192.168.1.168/2.ts;
+
+
 
 streammux:
   gpu-id: 0
@@ -70,7 +74,7 @@ streammux:
   width: 1024
   height: 768
   sync-inputs: 1
-  live-source: 1
+  # live-source: 1
 # preprocess0:
 #   enable: 1
 #   config-file-path: config_preprocess_RGBT.txt
