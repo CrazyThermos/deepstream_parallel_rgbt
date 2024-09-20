@@ -37,6 +37,7 @@
 
 #include <iostream>
 #include <fstream>
+#include <yaml-cpp/yaml.h>
 
 #include "gstnvdsmeta.h"
 #include "nvbufsurface.h"
@@ -47,8 +48,7 @@
 #include "nvds_obj_encode.h"
 #include "nvds_yml_parser.h"
 #include "gst-nvmessage.h"
-#include <yaml-cpp/yaml.h>
-
+#include "imu_data_process.h"
 #define _PATH_MAX 1024
 #define FILE_NAME_SIZE (1024)
 
@@ -105,7 +105,9 @@ static gboolean USE_POSTPROCESS = FALSE;
 static gboolean USE_SGIE = FALSE;
 static gboolean USE_VIDEOTEMP = FALSE;
 
-gint frame_number = 0, frame_count = 0;
+static gint frame_number = 0, frame_count = 0;
+double maxAngleVal = 0.0;
+int angleIndex = 0;
 
 #define CHECK_CUDA_STATUS(cuda_status,error_str) do { \
   if ((cuda_status) != cudaSuccess) { \
@@ -160,12 +162,19 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
       guint surface_width = surface->surfaceList[frame_meta->batch_id].width;
 
       //Create Mat from NvMM memory, refer opencv API for how to create a Mat
-      cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
-      surface->surfaceList[frame_meta->batch_id].pitch);
-      cv::Mat gray;
-      // temp.copyTo(trans_mat);
-      // cv::Mat dstROI = trans_mat(cv::Rect(0, 0, fusion_mat.cols, fusion_mat.rows));
-      cv::cvtColor(nv12_mat, gray, cv::COLOR_YUV2GRAY_NV12);
+
+        cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
+        surface->surfaceList[frame_meta->batch_id].pitch);
+        if(nv12_mat.empty()) return GST_PAD_PROBE_OK;
+        cv::Mat gray;
+        // temp.copyTo(trans_mat);
+        // cv::Mat dstROI = trans_mat(cv::Rect(0, 0, fusion_mat.cols, fusion_mat.rows));
+      try {
+        cv::cvtColor(nv12_mat, gray, cv::COLOR_YUV2GRAY_NV12);
+        
+      } catch (const cv::Exception& e) {
+      std::cerr << "cvtColor Error: " << e.what() << std::endl;
+      }
 
 
       NvBufSurface *inter_buf = nullptr;
@@ -191,7 +200,7 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
       NvBufSurfaceSyncForCpu (inter_buf, -1, -1);
       cv::Mat trans_mat = cv::Mat(surface_height, surface_width, CV_8UC1, inter_buf->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
     inter_buf->surfaceList[0].pitch);
-  
+      if(trans_mat.empty()) return GST_PAD_PROBE_OK;
       for (l_obj = frame_meta->obj_meta_list; l_obj != NULL;
           l_obj = l_obj->next) {
           obj_meta = (NvDsObjectMeta *) (l_obj->data);
@@ -214,8 +223,14 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
             obj_meta->rect_params.border_color.alpha = 0.5;
           }
           if(obj_meta->rect_params.left > surface_width/2) continue;
-          cv::Mat dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
-          obj_meta->rect_params.width, obj_meta->rect_params.height));
+          cv::Mat dstROI; 
+          try{
+            dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
+            obj_meta->rect_params.width, obj_meta->rect_params.height));
+          } catch (const cv::Exception& e) {
+            std::cerr << "dstROI Error: " << e.what() << std::endl;
+          }
+          if(dstROI.empty()) continue;
           // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
           cv::GaussianBlur(dstROI, dstROI, cv::Size(3, 3), 0);
           // cv::Mat edges;
@@ -341,14 +356,26 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           guint onechannel_size = fusion_height * fusion_width;
           float *outputCoverageBuffer =(float *) meta->output_layers_info[0].buffer;
           cv::Mat fusion_mat; 
+          cv::Mat postioning_mat;
           using image_type = uint8_t;
           int image_format = CV_8UC1;
           image_type* uint8Buffer = (image_type *)malloc(o_count * sizeof(image_type));
           for(int o_index=0; o_index < o_count; o_index++){
             uint8Buffer[o_index] = static_cast<uint8_t>(std::min(std::max(outputCoverageBuffer[o_index] * 255.0f, 0.0f), 255.0f));
           }
+          try{          
           fusion_mat = cv::Mat(fusion_height, fusion_width, image_format, uint8Buffer, fusion_width);
+          postioning_mat = cv::Mat(surface_height/2, surface_width/2, image_format, 255);
+          } catch (const cv::Exception& e) {
+            std::cerr << "fusion_mat Error: " << e.what() << std::endl;
+          }
+
+          // if(fusion_mat.empty()) return GST_PAD_PROBE_OK;
+          if(angleIndex == 1) draw_vertical_arrow(postioning_mat, maxAngleVal);
+          else draw_horizontal_arrow(postioning_mat, maxAngleVal);
+
           cv::resize(fusion_mat, fusion_mat,cv::Size(surface_width/2,surface_height/2));
+          
           // char file_name[128];
           // sprintf(file_name, "resize_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
           // cv::imwrite(file_name, fusion_mat);
@@ -377,9 +404,23 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 
           
           // 将源矩阵复制到目标矩阵的ROI区域
-          cv::Mat dstROI = gray(cv::Rect(0, fusion_height*2, fusion_width*2, fusion_height*2));
+          cv::Mat fusionDstROI;
+          cv::Mat arrowDstROI;
 
-          fusion_mat.copyTo(dstROI);
+          try{
+          fusionDstROI=gray(cv::Rect(0, surface_height/2, surface_width/2, surface_height/2));
+          arrowDstROI=gray(cv::Rect(surface_width/2, surface_height/2, surface_width/2, surface_height/2));
+          } catch (const cv::Exception& e) {
+          std::cerr << "copyTo Error: " << e.what() << std::endl;
+            
+          }
+
+          if(fusionDstROI.empty()) return GST_PAD_PROBE_OK;
+          fusion_mat.copyTo(fusionDstROI);
+
+          // if(fusionDstROI.empty()) return GST_PAD_PROBE_OK;
+          postioning_mat.copyTo(arrowDstROI);
+
           // cv::cvtColor(dstROInv12, temp, cv::COLOR_YUV2BGR_NV12);
           // char file_name[128];
           // sprintf(file_name, "fusion_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
@@ -465,7 +506,7 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
     NvDsMetaList * l_frame = NULL;
     NvDsMetaList * l_obj = NULL;
     NvDsDisplayMeta *display_meta = NULL;
-    NvDsObjectMetaList* temp_ptr;
+    NvDsObjectMetaList* temp_ptr = NULL;
 
     NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta (buf);
     // Get original raw data
@@ -611,10 +652,11 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           cudaStreamDestroy(cuda_stream);
 #endif
         }
-        else{
-          if (temp_ptr!=NULL&& ((NvDsFrameMeta *)(l_frame->data))->obj_meta_list!=NULL)
-          nvds_copy_obj_meta_list(temp_ptr, (NvDsFrameMeta *)(l_frame->data));
-
+        else if(frame_meta->batch_id == 1){
+          if (temp_ptr!=NULL){
+            nvds_copy_obj_meta_list(temp_ptr, (NvDsFrameMeta *)(l_frame->data));
+            temp_ptr = NULL;
+          }
         }
       if(!DEBUG_STAGE)
         g_print ("PGIE: Frame Number = %d Number of objects = %d "
@@ -790,6 +832,12 @@ sgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer ctx)
     }
     frame_count++;
     return GST_PAD_PROBE_OK;
+}
+
+static GstPadProbeReturn
+osd_src_pad_buffer_probe  (GstPad * pad, GstPadProbeInfo * info,
+    gpointer u_data)
+{
 }
 
 static gboolean
@@ -991,6 +1039,216 @@ create_http_bin (guint index, gchar * uri)
     return NULL;
   }
 
+  return bin;
+}
+
+static GstElement *
+create_mjpg_bin (guint index, gchar * uri)
+{
+  GstElement *bin = NULL, *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *videocrop1=NULL ,*videocrop2=NULL, *videoconvert1 = NULL,
+     *videoconvert2 = NULL, *videoconvert3 = NULL, *nvvidconv1 = NULL, *nvvidconv2 = NULL, * jpegdec = NULL,*cap_filter1=NULL,*cap_filter2=NULL,
+     *cap_filter3=NULL, *cap_filter4=NULL, *decode_bin=NULL,*decode_bin2=NULL,*queue1=NULL,*queue2=NULL,*tee=NULL,*nvvidconv=NULL;
+  GstCaps *caps1 = NULL,*caps2 = NULL,*caps3 = NULL,*caps4 = NULL;
+  GstCapsFeatures *feature = NULL;
+  gchar bin_name[16] = { };
+
+  g_snprintf (bin_name, 15, "source-bin-%02d", index);
+  /* Create a source GstBin to abstract this bin's content from the rest of the
+   * pipeline */
+  bin = gst_bin_new (bin_name);
+
+  v4l2src = gst_element_factory_make("v4l2src","v4l2-src");
+  if (!bin || !v4l2src) {
+    g_printerr ("One element in source bin could not be created.\n");
+    return NULL;
+  }
+  g_object_set(v4l2src, "device", "/dev/video0", NULL);
+  // g_object_set(v4l2src, "num-buffers", -1, NULL);
+
+
+  if (!bin || !v4l2src) {
+    g_printerr ("One element in source bin could not be created.\n");
+    return NULL;
+  }
+  jpegdec  = gst_element_factory_make("jpegdec","jpegdec");
+
+  caps1 = gst_caps_new_simple("image/jpeg",
+                                        "width", G_TYPE_INT, 1920,
+                                        "height", G_TYPE_INT, 1080,
+                                        "framerate", GST_TYPE_FRACTION, 25, 1,
+                                        NULL);
+
+  caps2 = gst_caps_new_simple("video/x-raw",
+                                        "format", G_TYPE_STRING, "NV12",
+                                        NULL);
+
+  
+  caps3 = gst_caps_new_simple("video/x-raw",
+                                      "format", G_TYPE_STRING, "NV12",
+                                      NULL);
+  feature = gst_caps_features_new("memory:NVMM", NULL);
+  gst_caps_set_features(caps3, 0, feature);
+  
+  caps4 = gst_caps_new_simple("video/x-raw",
+                                      "format", G_TYPE_STRING, "NV12",
+                                      NULL);
+  feature = gst_caps_features_new("memory:NVMM", NULL);
+  gst_caps_set_features(caps4, 0, feature);
+
+  srctee = gst_element_factory_make ("tee", "srctee");
+  if (!srctee) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srctee");
+    return NULL;
+  }
+
+  tee = gst_element_factory_make ("tee", "tee");
+  if (!tee) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "tee");
+    return NULL;
+  }
+
+  srcqueue1 = gst_element_factory_make ("queue", "srcqueue1");
+
+  if (!srcqueue1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srcqueue1");
+    return NULL;
+  }
+
+  srcqueue2 = gst_element_factory_make ("queue", "srcqueue2");
+  if (!srcqueue2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srcqueue2");
+    return NULL;
+  }
+  videocrop1 = gst_element_factory_make("videocrop", "videocrop1");
+  if (!videocrop1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videocrop1");
+    return NULL;
+  }
+
+  videocrop2 = gst_element_factory_make("videocrop", "videocrop2");
+  if (!videocrop2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videocrop2");
+    return NULL;
+  }
+  g_object_set(videocrop1, "left", 0, "right", 1280, "top", 0, "bottom", 568, NULL);
+  g_object_set(videocrop2, "left", 1280, "right", 0, "top", 0, "bottom", 568, NULL);
+
+
+  nvvidconv1 = gst_element_factory_make ("nvvideoconvert", "nvvidconv1");
+  if (!nvvidconv1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "nvvidconv1");
+    return NULL;
+  }
+
+  nvvidconv2 = gst_element_factory_make ("nvvideoconvert", "nvvidconv2");
+  if (!nvvidconv2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "nvvidconv2");
+    return NULL;
+  }
+
+  queue1 = gst_element_factory_make ("queue", "queue1");
+  if (!queue1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "queue1");
+    return NULL;
+  }
+
+  videoconvert1 = gst_element_factory_make ("videoconvert", "videoconvert1");
+  if (!videoconvert1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videoconvert1");
+    return NULL;
+  }
+
+  cap_filter1 = gst_element_factory_make ("capsfilter", "cap_filter1_nvvidconv");
+  if (!cap_filter1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter1");
+    return NULL;
+  }
+  g_object_set(G_OBJECT(cap_filter1), "caps", caps1, NULL);
+  gst_caps_unref(caps1);
+
+  cap_filter2 = gst_element_factory_make ("capsfilter", "cap_filter2_nvvidconv");
+  if (!cap_filter2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter2");
+    return NULL;
+  }
+  g_object_set(G_OBJECT(cap_filter2), "caps", caps2, NULL);
+  gst_caps_unref(caps2);
+
+  cap_filter3 = gst_element_factory_make ("capsfilter", "cap_filte3_nvvidconv");
+  if (!cap_filter3) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter3");
+    return NULL;
+  }
+  g_object_set(G_OBJECT(cap_filter3), "caps", caps3, NULL);
+  gst_caps_unref(caps3);
+
+  cap_filter4 = gst_element_factory_make ("capsfilter", "cap_filte4_nvvidconv");
+  if (!cap_filter4) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter4");
+    return NULL;
+  }
+  g_object_set(G_OBJECT(cap_filter4), "caps", caps4, NULL);
+  gst_caps_unref(caps4);
+
+  gst_bin_add_many (GST_BIN (bin), v4l2src, jpegdec, srctee, srcqueue1, srcqueue2, videocrop1, videocrop2,
+  videoconvert1, nvvidconv1, nvvidconv2,  cap_filter1, cap_filter2, cap_filter3,cap_filter4, NULL); //decode_bin,,queue2,queue1,tee,
+
+
+  if (!gst_element_link_many(v4l2src, cap_filter1, jpegdec, videoconvert1, NULL)) {
+        g_printerr("Failed to link jpegdec, videoconvert1.\n");
+        return NULL;
+    }
+  if (!gst_element_link_many(videoconvert1, cap_filter2, srctee, NULL)) {
+        g_printerr("Failed to link videoconvert1, and tee.\n");
+        return NULL;
+    }
+  if (!gst_element_link_many(srcqueue1, videocrop1,  nvvidconv1, cap_filter3, NULL)) {
+      g_printerr("Failed to link first branch.\n");
+      return NULL;
+  }
+
+  if (!gst_element_link_many(srcqueue2, videocrop2, nvvidconv2, cap_filter4, NULL)) {
+      g_printerr("Failed to link second branch.\n");
+      return NULL;
+  }
+
+  GstPad *tee_src_pad1 = gst_element_get_request_pad(srctee, "src_%u");
+  GstPad *queue1_sink_pad = gst_element_get_static_pad(srcqueue1, "sink");
+
+  GstPad *tee_src_pad2 = gst_element_get_request_pad(srctee, "src_%u");
+  GstPad *queue2_sink_pad = gst_element_get_static_pad(srcqueue2, "sink");
+
+  if (gst_pad_link(tee_src_pad1, queue1_sink_pad) != GST_PAD_LINK_OK ||
+      gst_pad_link(tee_src_pad2, queue2_sink_pad) != GST_PAD_LINK_OK) {
+      g_printerr("Tee could not be linked.\n");
+      // gst_object_unref(pipeline);
+      return NULL;
+  }
+
+  gst_object_unref(tee_src_pad1);
+  gst_object_unref(queue1_sink_pad);
+  gst_object_unref(tee_src_pad2);
+  gst_object_unref(queue2_sink_pad);
+
+  // gst_element_link_many(v4l2src, srctee, srcqueue, decode_bin, cap_filter, nvvidconv, cap_filter1, NULL);
+  /* We need to create a ghost pad for the source bin which will act as a proxy
+   * for the video decoder src pad. The ghost pad will not have a target right
+   * now. Once the decode bin creates the video decoder and generates the
+   * cb_newpad callback, we will set the ghost pad target to the video decoder
+   * src pad. */
+  GstPad *gstpad1 = gst_element_get_static_pad (cap_filter3, "src");
+  GstPad *gstpad2 = gst_element_get_static_pad (cap_filter4, "src");
+
+  if (!gst_element_add_pad (bin, gst_ghost_pad_new ("src1",
+              gstpad1))) {
+    g_printerr ("Failed to add ghost pad in source bin\n");
+    return NULL;
+  }
+  if (!gst_element_add_pad (bin, gst_ghost_pad_new("src2",
+              gstpad2))) {
+    g_printerr ("Failed to add ghost pad in source bin\n");
+    return NULL;
+  }
   return bin;
 }
 
@@ -1227,7 +1485,7 @@ main (int argc, char *argv[])
               
   GstBus *bus = NULL;
   guint bus_watch_id;
-  GstPad *tiler_src_pad = NULL, *pgie_src_pad = NULL, *sgie_src_pad = NULL;
+  GstPad *tiler_src_pad = NULL, *pgie_src_pad = NULL, *sgie_src_pad = NULL, *osd_src_pad = NULL;
   guint i =0, num_sources = 0;
   guint tiler_rows, tiler_columns;
   guint pgie_batch_size, sgie_batch_size;
@@ -1298,59 +1556,349 @@ main (int argc, char *argv[])
   } else {
       num_sources = argc - 1;
   }
+if(1){
 
-  for (i = 0; i < num_sources; i++) {
-    GstPad *sinkpad, *srcpad;
-    gchar pad_name[16] = { };
+#ifdef TEST_SRCBIN
+GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *videocrop1=NULL ,*videocrop2=NULL, *videoconvert1 = NULL,
+     *videoconvert2 = NULL, *videoconvert3 = NULL, *nvvidconv1 = NULL, *nvvidconv2 = NULL, * jpegdec = NULL,*cap_filter1=NULL,*cap_filter2=NULL,
+     *cap_filter3=NULL, *cap_filter4=NULL, *decode_bin=NULL,*decode_bin2=NULL,*queue1=NULL,*queue2=NULL,*tee=NULL,*nvvidconv=NULL;
+  GstCaps *caps1 = NULL,*caps2 = NULL,*caps3 = NULL,*caps4 = NULL;
+  GstCapsFeatures *feature = NULL;
+  gchar bin_name[16] = { };
 
-    GstElement *source_bin= NULL;
-    if (g_str_has_suffix (argv[1], ".yml") || g_str_has_suffix (argv[1], ".yaml")) {
-      char * uri = (char*)(src_list)->data;
-      g_print("Now playing : %s\n", uri);
-      if(uri[0] =='h' && uri[1] =='t' && uri[2] =='t' && uri[3] =='p'){
-           source_bin = create_http_bin (i, uri);
-      }
-      else source_bin = create_source_bin (i, uri);
-    } else {
-      source_bin = create_source_bin (i, argv[i + 1]);
+  v4l2src = gst_element_factory_make("v4l2src","v4l2-src");
+  if (!v4l2src) {
+    g_printerr ("One element in source bin could not be created.\n");
+    return -1;
+  }
+  g_object_set(v4l2src, "device", "/dev/video0", NULL);
+  // g_object_set(v4l2src, "num-buffers", -1, NULL);
+
+
+  if (!v4l2src) {
+    g_printerr ("One element in source bin could not be created.\n");
+    return -1;
+  }
+  jpegdec  = gst_element_factory_make("jpegdec","jpegdec");
+
+  caps1 = gst_caps_new_simple("image/jpeg",
+                                        "width", G_TYPE_INT, 1920,
+                                        "height", G_TYPE_INT, 1080,
+                                        "framerate", GST_TYPE_FRACTION, 25, 1,
+                                        NULL);
+
+  caps2 = gst_caps_new_simple("video/x-raw",
+                                        "format", G_TYPE_STRING, "NV12",
+                                        NULL);
+
+  
+  caps3 = gst_caps_new_simple("video/x-raw",
+                                      "format", G_TYPE_STRING, "NV12",
+                                      NULL);
+  feature = gst_caps_features_new("memory:NVMM", NULL);
+  gst_caps_set_features(caps3, 0, feature);
+  
+  caps4 = gst_caps_new_simple("video/x-raw",
+                                      "format", G_TYPE_STRING, "NV12",
+                                      NULL);
+  feature = gst_caps_features_new("memory:NVMM", NULL);
+  gst_caps_set_features(caps4, 0, feature);
+
+  srctee = gst_element_factory_make ("tee", "srctee");
+  if (!srctee) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srctee");
+    return -1;
+  }
+
+  tee = gst_element_factory_make ("tee", "tee");
+  if (!tee) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "tee");
+    return -1;
+  }
+
+  srcqueue1 = gst_element_factory_make ("queue", "srcqueue1");
+
+  if (!srcqueue1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srcqueue1");
+    return -1;
+  }
+
+  srcqueue2 = gst_element_factory_make ("queue", "srcqueue2");
+  if (!srcqueue2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "srcqueue2");
+    return -1;
+  }
+  videocrop1 = gst_element_factory_make("videocrop", "videocrop1");
+  if (!videocrop1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videocrop1");
+    return -1;
+  }
+
+  videocrop2 = gst_element_factory_make("videocrop", "videocrop2");
+  if (!videocrop2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videocrop2");
+    return -1;
+  }
+  g_object_set(videocrop1, "left", 0, "right", 1280, "top", 0, "bottom", 568, NULL);
+  g_object_set(videocrop2, "left", 1280, "right", 0, "top", 0, "bottom", 568, NULL);
+
+
+  nvvidconv1 = gst_element_factory_make ("nvvideoconvert", "nvvidconv1");
+  if (!nvvidconv1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "nvvidconv1");
+    return -1;
+  }
+
+  nvvidconv2 = gst_element_factory_make ("nvvideoconvert", "nvvidconv2");
+  if (!nvvidconv2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "nvvidconv2");
+    return -1;
+  }
+
+  queue1 = gst_element_factory_make ("queue", "queue1");
+  if (!queue1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "queue1");
+    return -1;
+  }
+
+  videoconvert1 = gst_element_factory_make ("videoconvert", "videoconvert1");
+  if (!videoconvert1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "videoconvert1");
+    return -1;
+  }
+
+  cap_filter1 = gst_element_factory_make ("capsfilter", "cap_filter1_nvvidconv");
+  if (!cap_filter1) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter1");
+    return -1;
+  }
+  g_object_set(G_OBJECT(cap_filter1), "caps", caps1, NULL);
+  gst_caps_unref(caps1);
+
+  cap_filter2 = gst_element_factory_make ("capsfilter", "cap_filter2_nvvidconv");
+  if (!cap_filter2) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter2");
+    return -1;
+  }
+  g_object_set(G_OBJECT(cap_filter2), "caps", caps2, NULL);
+  gst_caps_unref(caps2);
+
+  cap_filter3 = gst_element_factory_make ("capsfilter", "cap_filte3_nvvidconv");
+  if (!cap_filter3) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter3");
+    return -1;
+  }
+  g_object_set(G_OBJECT(cap_filter3), "caps", caps3, NULL);
+  gst_caps_unref(caps3);
+
+  cap_filter4 = gst_element_factory_make ("capsfilter", "cap_filte4_nvvidconv");
+  if (!cap_filter4) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter4");
+    return -1;
+  }
+  g_object_set(G_OBJECT(cap_filter4), "caps", caps4, NULL);
+  gst_caps_unref(caps4);
+
+  gst_bin_add_many (GST_BIN (pipeline), v4l2src, jpegdec, srctee, srcqueue1, srcqueue2, videocrop1, videocrop2,
+  videoconvert1, nvvidconv1, nvvidconv2,  cap_filter1, cap_filter2, cap_filter3,cap_filter4, NULL); //decode_bin,,queue2,queue1,tee,
+
+
+  if (!gst_element_link_many(v4l2src, cap_filter1, jpegdec, videoconvert1, NULL)) {
+        g_printerr("Failed to link jpegdec, videoconvert1.\n");
+        return -1;
     }
-    if (!source_bin) {
-      g_printerr ("Failed to create source bin. Exiting.\n");
+  if (!gst_element_link_many(videoconvert1, cap_filter2, srctee, NULL)) {
+        g_printerr("Failed to link videoconvert1, and tee.\n");
+        return -1;
+    }
+  if (!gst_element_link_many(srcqueue1, videocrop1,  nvvidconv1, cap_filter3, NULL)) {
+      g_printerr("Failed to link first branch.\n");
+      return -1;
+  }
+
+  if (!gst_element_link_many(srcqueue2, videocrop2, nvvidconv2, cap_filter4, NULL)) {
+      g_printerr("Failed to link second branch.\n");
+      return -1;
+  }
+
+  GstPad *tee_src_pad1 = gst_element_get_request_pad(srctee, "src_%u");
+  GstPad *queue1_sink_pad = gst_element_get_static_pad(srcqueue1, "sink");
+
+  GstPad *tee_src_pad2 = gst_element_get_request_pad(srctee, "src_%u");
+  GstPad *queue2_sink_pad = gst_element_get_static_pad(srcqueue2, "sink");
+
+  if (gst_pad_link(tee_src_pad1, queue1_sink_pad) != GST_PAD_LINK_OK ||
+      gst_pad_link(tee_src_pad2, queue2_sink_pad) != GST_PAD_LINK_OK) {
+      g_printerr("Tee could not be linked.\n");
+      // gst_object_unref(pipeline);
+      return -1;
+  }
+
+  gst_object_unref(tee_src_pad1);
+  gst_object_unref(queue1_sink_pad);
+  gst_object_unref(tee_src_pad2);
+  gst_object_unref(queue2_sink_pad);
+
+    // GstElement *source_bin= NULL;
+    GstPad *sinkpad1, *sinkpad2, *srcpad1, *srcpad2;
+    gchar pad_name[16] = { };
+    // source_bin = create_mjpg_bin (i, argv[i + 1]);
+    // if (!source_bin) {
+    //   g_printerr ("Failed to create source bin. Exiting.\n");
+    //   return -1;
+    // }
+
+    // gst_bin_add (GST_BIN (pipeline), source_bin);
+
+    g_snprintf (pad_name, 15, "sink_%u", 0);
+    sinkpad1 = gst_element_get_request_pad (streammux, pad_name);
+    if (!sinkpad1) {
+      g_printerr ("Streammux request sink pad failed. Exiting.\n");
       return -1;
     }
-
-    gst_bin_add (GST_BIN (pipeline), source_bin);
-
-    g_snprintf (pad_name, 15, "sink_%u", i);
-    sinkpad = gst_element_get_request_pad (streammux, pad_name);
-    if (!sinkpad) {
+    g_snprintf (pad_name, 15, "sink_%u", 1);
+    sinkpad2 = gst_element_get_request_pad (streammux, pad_name);
+    if (!sinkpad1) {
       g_printerr ("Streammux request sink pad failed. Exiting.\n");
       return -1;
     }
 
-    srcpad = gst_element_get_static_pad (source_bin, "src");
-    if (!srcpad) {
+    srcpad1 = gst_element_get_static_pad (cap_filter3, "src");
+    if (!srcpad1) {
+      g_printerr ("Failed to get src pad of source bin. Exiting.\n");
+      return -1;
+    }
+    srcpad2 = gst_element_get_static_pad (cap_filter4, "src");
+    if (!srcpad2) {
       g_printerr ("Failed to get src pad of source bin. Exiting.\n");
       return -1;
     }
 
-    if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
+    if (gst_pad_link (srcpad1, sinkpad1) != GST_PAD_LINK_OK) {
       g_printerr ("Failed to link source bin to stream muxer. Exiting.\n");
       return -1;
     }
+    if (gst_pad_link (srcpad2, sinkpad2) != GST_PAD_LINK_OK) {
+      g_printerr ("Failed to link source bin to stream muxer. Exiting.\n");
+      return -1;
+    }
+    gst_object_unref (srcpad1);
+    gst_object_unref (sinkpad1);
+    gst_object_unref (srcpad2);
+    gst_object_unref (sinkpad2);
+#endif
+    GstElement *source_bin= NULL;
+    GstPad *sinkpad1, *sinkpad2, *srcpad1, *srcpad2;
+    gchar pad_name[16] = { };
+    source_bin = create_mjpg_bin (0, argv[i + 1]);
+    if (!source_bin) {
+      g_printerr ("Failed to create source bin. Exiting.\n");
+      return -1;
+    }
+    if (!source_bin) {
+        g_printerr ("Failed to create source bin. Exiting.\n");
+        return -1;
+      }
 
-    gst_object_unref (srcpad);
-    gst_object_unref (sinkpad);
+      gst_bin_add (GST_BIN (pipeline), source_bin);
 
-    if (yaml_config) {
-      src_list = src_list->next;
+      g_snprintf (pad_name, 15, "sink_%u", 0);
+      sinkpad1 = gst_element_get_request_pad (streammux, pad_name);
+      if (!sinkpad1) {
+        g_printerr ("Streammux request sink pad failed. Exiting.\n");
+        return -1;
+      }
+
+      srcpad1 = gst_element_get_static_pad (source_bin, "src1");
+      if (!srcpad1) {
+        g_printerr ("Failed to get src pad of source bin. Exiting.\n");
+        return -1;
+      }
+
+      if (gst_pad_link (srcpad1, sinkpad1) != GST_PAD_LINK_OK) {
+        g_printerr ("Failed to link source bin to stream muxer. Exiting.\n");
+        return -1;
+      }
+      
+      g_snprintf (pad_name, 15, "sink_%u", 1);
+      sinkpad2 = gst_element_get_request_pad (streammux, pad_name);
+      if (!sinkpad2) {
+        g_printerr ("Streammux request sink pad failed. Exiting.\n");
+        return -1;
+      }
+
+      srcpad2 = gst_element_get_static_pad (source_bin, "src2");
+      if (!srcpad2) {
+        g_printerr ("Failed to get src pad of source bin. Exiting.\n");
+        return -1;
+      }
+
+      if (gst_pad_link (srcpad2, sinkpad2) != GST_PAD_LINK_OK) {
+        g_printerr ("Failed to link source bin to stream muxer. Exiting.\n");
+        return -1;
+      }
+      gst_object_unref (srcpad1);
+      gst_object_unref (sinkpad1);
+      gst_object_unref (srcpad2);
+      gst_object_unref (sinkpad2);
+
+    // gst_bin_add (GST_BIN (pipeline), source_bin);
+  } 
+  else{
+    for (i = 0; i < num_sources; i++) {
+      GstPad *sinkpad, *srcpad;
+      gchar pad_name[16] = { };
+
+      GstElement *source_bin= NULL;
+      if (g_str_has_suffix (argv[1], ".yml") || g_str_has_suffix (argv[1], ".yaml")) {
+        char * uri = (char*)(src_list)->data;
+        g_print("Now playing : %s\n", uri);
+        if(uri[0] =='h' && uri[1] =='t' && uri[2] =='t' && uri[3] =='p'){
+             source_bin = create_http_bin (i, uri);
+        }
+        else source_bin = create_source_bin (i, uri);
+      } 
+      else {
+        source_bin = create_source_bin (i, argv[i + 1]);
+      }
+      
+      if (!source_bin) {
+        g_printerr ("Failed to create source bin. Exiting.\n");
+        return -1;
+      }
+
+      gst_bin_add (GST_BIN (pipeline), source_bin);
+
+      g_snprintf (pad_name, 15, "sink_%u", i);
+      sinkpad = gst_element_get_request_pad (streammux, pad_name);
+      if (!sinkpad) {
+        g_printerr ("Streammux request sink pad failed. Exiting.\n");
+        return -1;
+      }
+
+      srcpad = gst_element_get_static_pad (source_bin, "src");
+      if (!srcpad) {
+        g_printerr ("Failed to get src pad of source bin. Exiting.\n");
+        return -1;
+      }
+
+      if (gst_pad_link (srcpad, sinkpad) != GST_PAD_LINK_OK) {
+        g_printerr ("Failed to link source bin to stream muxer. Exiting.\n");
+        return -1;
+      }
+
+      gst_object_unref (srcpad);
+      gst_object_unref (sinkpad);
+
+      if (yaml_config) {
+        src_list = src_list->next;
+      }
     }
   }
 
-  if (yaml_config) {
-    g_list_free(src_list);
-  }
-
+    if (yaml_config) {
+      g_list_free(src_list);
+    }
   // preprocess0 = gst_element_factory_make ("nvdspreprocess", "preprocess0");
   // preprocess1 = gst_element_factory_make ("nvdspreprocess", "preprocess1");
 
@@ -1537,6 +2085,7 @@ main (int argc, char *argv[])
         "display-text", OSD_DISPLAY_TEXT, NULL);
 
     g_object_set (G_OBJECT (sink), "qos", 0, "type", 1 ,NULL);
+    g_object_set(G_OBJECT(sink), "fullscreen", TRUE, NULL);
 
   }
 
@@ -1700,6 +2249,17 @@ main (int argc, char *argv[])
   //         sgie_src_pad_buffer_probe, NULL, NULL);
   //   gst_object_unref (sgie_src_pad);
   // }
+  osd_src_pad = gst_element_get_static_pad (nvosd, "src");
+  // NvDsObjEncCtxHandle obj_ctx_handle = nvds_obj_enc_create_context (0);
+  if (!osd_src_pad)
+    g_print ("Unable to get src pad\n");
+  else
+    gst_pad_add_probe (osd_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        osd_src_pad_buffer_probe, (gpointer) NULL, NULL);
+  gst_object_unref (osd_src_pad);
+
+  std::thread sock_recesive_thread(sock_recesive);
+  std::thread handle_press_thread(handle_button_press, std::ref(maxAngleVal), std::ref(angleIndex));
 
   /* Set the pipeline to "playing" state */
   if (yaml_config) {
@@ -1741,6 +2301,8 @@ main (int argc, char *argv[])
   g_print ("Returned, stopping playback\n");
   gst_element_set_state (pipeline, GST_STATE_NULL);
   g_print ("Deleting pipeline\n");
+  sock_recesive_thread.join();
+  handle_press_thread.join();
   gst_object_unref (GST_OBJECT (pipeline));
   g_source_remove (bus_watch_id);
   g_main_loop_unref (loop);

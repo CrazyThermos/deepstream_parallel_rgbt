@@ -53,7 +53,7 @@ CFLAGS+= -I../../../includes \
 		 -I /usr/include/glib-2.0 \
 		 -I /usr/include/c++/9 \
 		 -I/usr/include/aarch64-linux-gnu/c++/9/ \
-		 -I./ -I../../apps-common/includes \
+		 -I./ \
 		 -I /usr/lib/aarch64-linux-gnu/glib-2.0/include \
 		 -I /usr/local/cuda-$(CUDA_VER)/include \
 		 -I /usr/include/opencv4
@@ -68,7 +68,7 @@ LIBS:= $(shell pkg-config --libs $(PKGS))
 LIBS+= -L/usr/local/cuda-$(CUDA_VER)/lib64/ -lcudart -lnvdsgst_helper -lgstrtspserver-1.0 -lm \
 		-L$(LIB_INSTALL_DIR) -lnvdsgst_meta -lnvds_meta -lnvds_yml_parser -lyaml-cpp -lnvds_msgbroker\
 		-L/opt/nvidia/deepstream/deepstream/lib/cvcore_libs/ -lnvdsgst_smartrecord\
-		-lnvds_batch_jpegenc -lnvbufsurface -lnvbufsurftransform -lnvcv_core \
+		-lnvds_batch_jpegenc -lnvbufsurface -lnvbufsurftransform -lnvcv_core -lpthread -lJetsonGPIO\
 		-lcuda -ldl -Wl,-rpath,$(LIB_INSTALL_DIR)
 
 ifeq ($(WITH_OPENCV),1)

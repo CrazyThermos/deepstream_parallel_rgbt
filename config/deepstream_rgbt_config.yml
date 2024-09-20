@@ -61,7 +61,7 @@
 source-list:
   # semicolon separated uri. For ex- uri1;uri2;uriN;
   # list: file:///opt/nvidia/deepstream/deepstream/samples/streams/sample_1080p_h264.mp4;
-  list: file:/workspace/datasets/vi.mp4;file:/workspace/datasets/ir.mp4;
+  list: file:/home/orin/Downloads/vi.mp4;file:/home/orin/Downloads/ir.mp4;
   # list: rtsp://192.168.1.106:18554/vi;rtsp://192.168.1.106:28554/ir;
   # list: http://192.168.1.167/2.ts;http://192.168.1.168/2.ts;
 
@@ -71,9 +71,11 @@ streammux:
   gpu-id: 0
   batch-size: 2
   batched-push-timeout: 40000
-  width: 1024
-  height: 768
-  sync-inputs: 1
+  # width: 1024
+  # height: 768
+  width: 640
+  height: 512
+  # sync-inputs: 1
   # live-source: 1
 # preprocess0:
 #   enable: 1
@@ -87,20 +89,20 @@ streammux-b0:
   gpu-id: 0
   batch-size: 2
   batched-push-timeout: 40000
-  width: 1024
-  height: 768
+  width: 640
+  height: 512
   sync-inputs: 1
-  live-source: 1
+  # live-source: 1
 
 
 streammux-b1:
   gpu-id: 0
   batch-size: 2
   batched-push-timeout: 40000
-  width: 1024
-  height: 768
+  width: 640
+  height: 512
   sync-inputs: 1
-  live-source: 1
+  # live-source: 1
 
 
 osd:
@@ -111,8 +113,8 @@ osd:
 tiler:
   rows: 2
   columns: 2
-  width: 2048
-  height: 1536
+  width: 1920
+  height: 1080
 
 sink:
   qos: 0

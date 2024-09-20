@@ -9,6 +9,6 @@ export GST_DEBUG_DUMP_DOT_DIR=pic/
 export NVDS_TEST3_PERF_MODE=1
 # export NVDS_TEST3_USE_POSTPROCESS=1
 # export NVDS_TEST3_USE_SGIE=1
-
+export LD_LIBRARY_PATH=/usr/local/lib/:$LD_LIBRARY_PATH
 # 执行
 ./deepstream-parallel-app ./config/deepstream_rgbt_config.yml 
