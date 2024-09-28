@@ -30,11 +30,11 @@
 #include <cuda_runtime_api.h>
 #include <cstdint>
 #include <opencv2/opencv.hpp>
-#include "opencv2/imgproc/imgproc.hpp"
-#include "opencv2/highgui/highgui.hpp"
+#include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <cuda.h>
 #include <cuda_runtime.h>
-
+#include <chrono>
 #include <iostream>
 #include <fstream>
 #include <yaml-cpp/yaml.h>
@@ -53,9 +53,11 @@
 #define FILE_NAME_SIZE (1024)
 
 #define MAX_DISPLAY_LEN 64
+#define MAX_DUMP_COUNT 1000
+#define DUMP_STEP 50 //frame
 
-#define PGIE_CLASS_ID_VEHICLE 0
-#define PGIE_CLASS_ID_PERSON 2
+#define PGIE_CLASS_ID_VEHICLE 1
+#define PGIE_CLASS_ID_PERSON 0
 
 /* By default, OSD process-mode is set to GPU_MODE. To change mode, set as:
  * 0: CPU mode
@@ -100,14 +102,16 @@ gchar pgie_classes_str[6][32] = {"people"
                                 "truck"
                                 };
 
+static gboolean RELEASE_MODE = FALSE;
+static gboolean EVAL_MODE = FALSE;
 static gboolean PERF_MODE = FALSE;
 static gboolean USE_POSTPROCESS = FALSE;
 static gboolean USE_SGIE = FALSE;
 static gboolean USE_VIDEOTEMP = FALSE;
-
-static gint frame_number = 0, frame_count = 0;
+static gboolean USE_DRMSINK = FALSE;
 double maxAngleVal = 0.0;
 int angleIndex = 0;
+const char* dump_path = "/mnt/usb/";
 
 #define CHECK_CUDA_STATUS(cuda_status,error_str) do { \
   if ((cuda_status) != cudaSuccess) { \
@@ -117,12 +121,25 @@ int angleIndex = 0;
 } while (0)
 
 #define DEBUG_STAGE 0
+
+
+void dump_image(const cv::Mat& image, const std::string& filename) {
+    try {
+        cv::imwrite(filename, image);
+    } catch (const cv::Exception& ex) {
+        std::cerr << "Error: Could not save image. " << ex.what() << std::endl;
+    }
+}
+
 /* tiler_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
  * and update params for drawing rectangle, object information etc. */
 static GstPadProbeReturn
 tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
     gpointer u_data)
 {
+  static gint frame_number = 0;
+  static gint dump_count = 0;
+
   if (DEBUG_STAGE){
     g_print("tiler_src_pad_buffer_probe start");
   }
@@ -137,7 +154,6 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 
   NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta (buf);
 
-#if 1
   // Get original raw data
   GstMapInfo in_map_info;
   if (!gst_buffer_map (buf, &in_map_info, GST_MAP_READ)) {
@@ -146,7 +162,6 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
       return GST_PAD_PROBE_OK;
   }
   NvBufSurface *surface = (NvBufSurface *)in_map_info.data;
-#endif
 
   for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
     l_frame = l_frame->next) {
@@ -163,19 +178,33 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 
       //Create Mat from NvMM memory, refer opencv API for how to create a Mat
 
-        cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
-        surface->surfaceList[frame_meta->batch_id].pitch);
-        if(nv12_mat.empty()) return GST_PAD_PROBE_OK;
-        cv::Mat gray;
-        // temp.copyTo(trans_mat);
-        // cv::Mat dstROI = trans_mat(cv::Rect(0, 0, fusion_mat.cols, fusion_mat.rows));
+      cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
+      surface->surfaceList[frame_meta->batch_id].pitch);
+      if(nv12_mat.empty()) return GST_PAD_PROBE_OK;
+      cv::Mat gray;
+      // temp.copyTo(trans_mat);
+      // cv::Mat dstROI = trans_mat(cv::Rect(0, 0, fusion_mat.cols, fusion_mat.rows));
       try {
         cv::cvtColor(nv12_mat, gray, cv::COLOR_YUV2GRAY_NV12);
-        
       } catch (const cv::Exception& e) {
-      std::cerr << "cvtColor Error: " << e.what() << std::endl;
+        std::cerr << "cvtColor Error: " << e.what() << std::endl;
       }
 
+      if(EVAL_MODE && frame_number % DUMP_STEP == 0 && dump_count <= MAX_DUMP_COUNT){
+        dump_count++;
+        // char file_name[128];
+        // sprintf(file_name, "dbd/vis_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
+
+        // auto now = std::chrono::system_clock::now();
+        // auto duration = now.time_since_epoch();
+        // auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        std::string file_name = "dbd/vis_stream_" + std::to_string(frame_number) + ".png";
+        std::string path_name = dump_path + file_name;
+        std::cout << "Image saved as " << path_name << std::endl;
+        cv::Mat dump_gray = gray.clone();
+        std::thread dump(dump_image, dump_gray, path_name);
+        dump.detach();
+      }
 
       NvBufSurface *inter_buf = nullptr;
       NvBufSurfaceCreateParams create_params;
@@ -195,69 +224,15 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
         GST_ERROR ("Error: Could not allocate internal buffer ");
         return GST_PAD_PROBE_OK;
       }
-      if(NvBufSurfaceMap (inter_buf, 0, -1, NVBUF_MAP_READ_WRITE) != 0)
-        std::cout << "map error" << std::endl;
+      if(NvBufSurfaceMap (inter_buf, 0, -1, NVBUF_MAP_READ_WRITE) != 0){
+        GST_ERROR ("Error: tiler_src_pad_buffer_probe Could not NvBufSurfaceMap  ");
+        return GST_PAD_PROBE_OK;
+      }
       NvBufSurfaceSyncForCpu (inter_buf, -1, -1);
       cv::Mat trans_mat = cv::Mat(surface_height, surface_width, CV_8UC1, inter_buf->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
     inter_buf->surfaceList[0].pitch);
       if(trans_mat.empty()) return GST_PAD_PROBE_OK;
-      for (l_obj = frame_meta->obj_meta_list; l_obj != NULL;
-          l_obj = l_obj->next) {
-          obj_meta = (NvDsObjectMeta *) (l_obj->data);
-          if (obj_meta->class_id % 3 == 0) {
-            obj_meta->rect_params.border_color.red = 1.0;
-            obj_meta->rect_params.border_color.green = 0.0;
-            obj_meta->rect_params.border_color.blue = 0.0;
-            obj_meta->rect_params.border_color.alpha = 0.5;
-          }
-          if (obj_meta->class_id % 3 == 1) {
-            obj_meta->rect_params.border_color.red = 0.0;
-            obj_meta->rect_params.border_color.green = 1.0;
-            obj_meta->rect_params.border_color.blue = 0.0;
-            obj_meta->rect_params.border_color.alpha = 0.5;
-          }
-          if (obj_meta->class_id % 3 == 2) {
-            obj_meta->rect_params.border_color.red = 0.0;
-            obj_meta->rect_params.border_color.green = 0.0;
-            obj_meta->rect_params.border_color.blue = 1.0;
-            obj_meta->rect_params.border_color.alpha = 0.5;
-          }
-          if(obj_meta->rect_params.left > surface_width/2) continue;
-          cv::Mat dstROI; 
-          try{
-            dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
-            obj_meta->rect_params.width, obj_meta->rect_params.height));
-          } catch (const cv::Exception& e) {
-            std::cerr << "dstROI Error: " << e.what() << std::endl;
-          }
-          if(dstROI.empty()) continue;
-          // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
-          cv::GaussianBlur(dstROI, dstROI, cv::Size(3, 3), 0);
-          // cv::Mat edges;
-          // cv::Canny(dstROI, edges, 100, 255, 3, false);
-          // cv::addWeighted(dstROI, 1, weights, 30, 0, dstROI);
-
-          // Prewitt
-          const int kernel_size = 3;
-          int xarr[kernel_size][kernel_size] = {{1,1,1},{0,0,0},{-1,-1,-1}};
-          int yarr[kernel_size][kernel_size] = {{-1,0,1},{-1,0,1},{-1,0,1}};
-
-          cv::Mat kernelx = cv::Mat(kernel_size, kernel_size, CV_8U, xarr);
-          cv::Mat kernely = cv::Mat(kernel_size, kernel_size, CV_8U, yarr);
-          cv::Mat x,y;
-          cv::filter2D(dstROI, x, CV_8UC1, kernelx);
-          cv::filter2D(dstROI, y, CV_8UC1, kernely);
-          cv::convertScaleAbs(x, x);
-          cv::convertScaleAbs(y, y);
-          cv::addWeighted(x, 0.5, y, 0.5, 0, x);
-          cv::normalize(x, x, 0, 255, cv::NORM_MINMAX);
-          cv::threshold(x, x, 50, 255, cv::THRESH_TRUNC);
-          cv::addWeighted(dstROI, 1, x, 1, 0, dstROI);
-          num_rects++;
-      }
-      // gray.copyTo(trans_mat);
-      if(!DEBUG_STAGE)
-      g_print ("TILER: Frame Number = %d Number of objects = %d\n", frame_meta->frame_num, num_rects);
+      
 
 #if 0
       /* To verify  encoded metadata of cropped frames, we iterate through the
@@ -375,10 +350,21 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           else draw_horizontal_arrow(postioning_mat, maxAngleVal);
 
           cv::resize(fusion_mat, fusion_mat,cv::Size(surface_width/2,surface_height/2));
-          
-          // char file_name[128];
-          // sprintf(file_name, "resize_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
-          // cv::imwrite(file_name, fusion_mat);
+          if(EVAL_MODE && frame_number % DUMP_STEP == 0 && dump_count <= MAX_DUMP_COUNT){
+            // char file_name[FILE_NAME_SIZE];
+            // sprintf(file_name, "dbd/fusion_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
+            // auto now = std::chrono::system_clock::now();
+            // auto duration = now.time_since_epoch();
+            // auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+            std::string file_name = "dbd/fusion_stream_" +  std::to_string(frame_number) + ".png";
+            std::string path_name = dump_path + file_name;
+            std::cout << "Image saved as " << path_name << std::endl;
+            cv::Mat dump_fusion_mat = fusion_mat.clone();
+            std::thread dump(dump_image, dump_fusion_mat, path_name);
+            dump.detach();
+          }
+
+
 #if 0
           image_type* uint8Buffer_C1 = (image_type *)malloc(onechannel_size * sizeof(image_type));
           image_type* uint8Buffer_C2 = (image_type *)malloc(onechannel_size * sizeof(image_type));
@@ -402,17 +388,72 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
           cv::merge(channels, fusion_mat);
 #endif
 
-          
+        for (l_obj = frame_meta->obj_meta_list; l_obj != NULL;
+          l_obj = l_obj->next) {
+          obj_meta = (NvDsObjectMeta *) (l_obj->data);
+          if (obj_meta->class_id % 3 == 0) {
+            obj_meta->rect_params.border_color.red = 1.0;
+            obj_meta->rect_params.border_color.green = 0.0;
+            obj_meta->rect_params.border_color.blue = 0.0;
+            obj_meta->rect_params.border_color.alpha = 0.5;
+          }
+          if (obj_meta->class_id % 3 == 1) {
+            obj_meta->rect_params.border_color.red = 0.0;
+            obj_meta->rect_params.border_color.green = 1.0;
+            obj_meta->rect_params.border_color.blue = 0.0;
+            obj_meta->rect_params.border_color.alpha = 0.5;
+          }
+          if (obj_meta->class_id % 3 == 2) {
+            obj_meta->rect_params.border_color.red = 0.0;
+            obj_meta->rect_params.border_color.green = 0.0;
+            obj_meta->rect_params.border_color.blue = 1.0;
+            obj_meta->rect_params.border_color.alpha = 0.5;
+          }
+          if(obj_meta->rect_params.left > surface_width/2) continue;
+          cv::Mat dstROI; 
+          try{
+            dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
+            obj_meta->rect_params.width, obj_meta->rect_params.height));
+          } catch (const cv::Exception& e) {
+            std::cerr << "dstROI Error: " << e.what() << std::endl;
+          }
+          if(dstROI.empty()) continue;
+          // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
+          cv::GaussianBlur(dstROI, dstROI, cv::Size(3, 3), 0);
+          // cv::Mat edges;
+          // cv::Canny(dstROI, edges, 100, 255, 3, false);
+          // cv::addWeighted(dstROI, 1, weights, 30, 0, dstROI);
+
+          // Prewitt
+          const int kernel_size = 3;
+          int xarr[kernel_size][kernel_size] = {{1,1,1},{0,0,0},{-1,-1,-1}};
+          int yarr[kernel_size][kernel_size] = {{-1,0,1},{-1,0,1},{-1,0,1}};
+
+          cv::Mat kernelx = cv::Mat(kernel_size, kernel_size, CV_8U, xarr);
+          cv::Mat kernely = cv::Mat(kernel_size, kernel_size, CV_8U, yarr);
+          cv::Mat x,y;
+          cv::filter2D(dstROI, x, CV_8UC1, kernelx);
+          cv::filter2D(dstROI, y, CV_8UC1, kernely);
+          cv::convertScaleAbs(x, x);
+          cv::convertScaleAbs(y, y);
+          cv::addWeighted(x, 0.5, y, 0.5, 0, x);
+          cv::normalize(x, x, 0, 255, cv::NORM_MINMAX);
+          cv::threshold(x, x, 50, 255, cv::THRESH_TRUNC);
+          cv::addWeighted(dstROI, 1, x, 1, 0, dstROI);
+          num_rects++;
+      }
+      // gray.copyTo(trans_mat);
+      if(!DEBUG_STAGE && frame_number%100==0)
+      g_print ("TILER: Frame Number = %d Number of objects = %d\n", frame_number, num_rects);
           // 将源矩阵复制到目标矩阵的ROI区域
           cv::Mat fusionDstROI;
           cv::Mat arrowDstROI;
 
           try{
-          fusionDstROI=gray(cv::Rect(0, surface_height/2, surface_width/2, surface_height/2));
-          arrowDstROI=gray(cv::Rect(surface_width/2, surface_height/2, surface_width/2, surface_height/2));
+            fusionDstROI=gray(cv::Rect(0, surface_height/2, surface_width/2, surface_height/2));
+            arrowDstROI=gray(cv::Rect(surface_width/2, surface_height/2, surface_width/2, surface_height/2));
           } catch (const cv::Exception& e) {
-          std::cerr << "copyTo Error: " << e.what() << std::endl;
-            
+            std::cerr << "copyTo Error: " << e.what() << std::endl;
           }
 
           if(fusionDstROI.empty()) return GST_PAD_PROBE_OK;
@@ -432,6 +473,11 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
       g_print("NvBufSurfTransformRect\n");
     }
       gray.copyTo(trans_mat);
+      // if(EVAL_MODE && frame_number % 250 == 0 && frame_number <= 15000){
+      //     char file_name[128];
+      //     sprintf(file_name, "/home/orin/Desktop/record/all_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
+      //     cv::imwrite(file_name, trans_mat);
+      // }
       NvBufSurfaceSyncForDevice(inter_buf, -1, -1);
       inter_buf->numFilled = 1;
       NvBufSurfTransformConfigParams transform_config_params;
@@ -476,28 +522,27 @@ tiler_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 
     // nvds_copy_obj_meta();
     cudaStreamDestroy(cuda_stream);
-    NvBufSurfaceUnMap(inter_buf, 0, 0);
+    NvBufSurfaceUnMap(inter_buf, -1, -1);
     NvBufSurfaceDestroy(inter_buf);
-    NvBufSurfaceUnMap(surface, 0, 0);
+    NvBufSurfaceUnMap(surface, -1, -1);
     gst_buffer_unmap(buf, &in_map_info);
 #endif 
 
   }
+  frame_number++;
+
   if (DEBUG_STAGE){
     g_print("tiler_src_pad_buffer_probe end\n");
   }
-  frame_number++;
   return GST_PAD_PROBE_OK;
 }
 
-
-/* tiler_sink_pad_buffer_probe  will extract metadata received on OSD sink pad
- * and update params for drawing rectangle, object information etc. */
-
+/* pgie_src_pad_buffer_probe */
 static GstPadProbeReturn
 pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
     gpointer u_data)
 {
+    static gint frame_number = 0;
     GstBuffer *buf = (GstBuffer *) info->data;
     guint num_rects = 0; 
     NvDsObjectMeta *obj_meta = NULL;
@@ -525,45 +570,6 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
               //TODO for cuda device memory we need to use cudamemcpy
         if(frame_meta->batch_id == 0){
           temp_ptr = frame_meta->obj_meta_list;
-#if 0
-          NvBufSurfaceMap (surface, -1, -1, NVBUF_MAP_READ);
-          /* Cache the mapped data for CPU access */
-          NvBufSurfaceSyncForCpu (surface, -1, -1); //will do nothing for unified memory type on dGPU
-          guint surface_height = surface->surfaceList[frame_meta->batch_id].height;
-          guint surface_width = surface->surfaceList[frame_meta->batch_id].width;
-
-          //Create Mat from NvMM memory, refer opencv API for how to create a Mat
-          cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[frame_meta->batch_id].mappedAddr.addr[0],
-          surface->surfaceList[frame_meta->batch_id].pitch);
-
-          cv::Mat gray;
-          cv::cvtColor(nv12_mat, gray, cv::COLOR_YUV2GRAY_NV12);
-
-          NvBufSurface *inter_buf = nullptr;
-          NvBufSurfaceCreateParams create_params;
-          create_params.gpuId  = surface->gpuId;
-          create_params.width  = surface_width;
-          create_params.height = surface_height;
-          create_params.size = 0;
-          create_params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
-          create_params.layout = NVBUF_LAYOUT_PITCH;
-        #ifdef __aarch64__
-          create_params.memType = NVBUF_MEM_DEFAULT;
-        #else
-          create_params.memType = NVBUF_MEM_CUDA_UNIFIED;
-        #endif
-          //Create another scratch RGBA NvBufSurface
-          if (NvBufSurfaceCreate (&inter_buf, 1,
-            &create_params) != 0) {
-            GST_ERROR ("Error: Could not allocate internal buffer ");
-            return GST_PAD_PROBE_OK;
-          }
-          if(NvBufSurfaceMap (inter_buf, 0, -1, NVBUF_MAP_READ_WRITE) != 0)
-            std::cout << "map error" << std::endl;
-          NvBufSurfaceSyncForCpu (inter_buf, -1, -1);
-          cv::Mat inter_mat = cv::Mat(surface_height, surface_width, CV_8UC1, inter_buf->surfaceList[0].mappedAddr.addr[0],
-            inter_buf->surfaceList[0].pitch);
-
           for (l_obj = frame_meta->obj_meta_list; l_obj != NULL;
                   l_obj = l_obj->next) {
               obj_meta = (NvDsObjectMeta *) (l_obj->data);
@@ -575,82 +581,7 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
                   person_count++;
                   num_rects++;
               }
-
-              cv::Mat dstROI = gray(cv::Rect(obj_meta->rect_params.left, obj_meta->rect_params.top, 
-              obj_meta->rect_params.width, obj_meta->rect_params.height));
-              // cv::Mat weights = cv::Mat::ones(dstROI.size(), dstROI.type());
-              cv::GaussianBlur(dstROI, dstROI, cv::Size(3, 3), 0);
-              // cv::Mat edges;
-              // cv::Canny(dstROI, edges, 100, 255, 3, false);
-              // cv::addWeighted(dstROI, 1, weights, 30, 0, dstROI);
-
-              // Prewitt
-              const int kernel_size = 3;
-              int xarr[kernel_size][kernel_size] = {{1,1,1},{0,0,0},{-1,-1,-1}};
-              int yarr[kernel_size][kernel_size] = {{-1,0,1},{-1,0,1},{-1,0,1}};
-
-              cv::Mat kernelx = cv::Mat(kernel_size, kernel_size, CV_8U, xarr);
-              cv::Mat kernely = cv::Mat(kernel_size, kernel_size, CV_8U, yarr);
-              cv::Mat x,y;
-              cv::filter2D(dstROI, x, CV_8UC1, kernelx);
-              cv::filter2D(dstROI, y, CV_8UC1, kernely);
-              cv::convertScaleAbs(x, x);
-              cv::convertScaleAbs(y, y);
-              cv::addWeighted(x, 0.5, y, 0.5, 0, x);
-              cv::normalize(x, x, 0, 255, cv::NORM_MINMAX);
-              cv::threshold(x, x, 50, 255, cv::THRESH_TRUNC);
-              cv::addWeighted(dstROI, 1, x, 1, 0, dstROI);
-
           }
-
-          gray.copyTo(inter_mat);
-
-          NvBufSurfaceSyncForDevice(inter_buf, -1, -1);
-          inter_buf->numFilled = 1;
-          NvBufSurfTransformConfigParams transform_config_params;
-          NvBufSurfTransformParams transform_params;
-          NvBufSurfTransformRect src_rect;
-          NvBufSurfTransformRect dst_rect;
-          cudaStream_t cuda_stream;
-          CHECK_CUDA_STATUS (cudaStreamCreate (&cuda_stream),
-            "Could not create cuda stream");
-          transform_config_params.compute_mode = NvBufSurfTransformCompute_Default;
-          transform_config_params.gpu_id = surface->gpuId;
-          transform_config_params.cuda_stream = cuda_stream;
-          /* Set the transform session parameters for the conversions executed in this
-            * thread. */
-          NvBufSurfTransform_Error err = NvBufSurfTransformSetSessionParams (&transform_config_params);
-          if (err != NvBufSurfTransformError_Success) {
-            std::cout <<"NvBufSurfTransformSetSessionParams failed with error "<< err << std::endl;
-            return GST_PAD_PROBE_OK;
-          }
-          /* Set the transform ROIs for source and destination, only do the color format conversion*/
-          src_rect = {0, 0, surface_width, surface_height};
-          dst_rect = {0, 0, surface_width, surface_height};
-
-          /* Set the transform parameters */
-          transform_params.src_rect = &src_rect;
-          transform_params.dst_rect = &dst_rect;
-          transform_params.transform_flag =
-            NVBUFSURF_TRANSFORM_FILTER | NVBUFSURF_TRANSFORM_CROP_SRC |
-              NVBUFSURF_TRANSFORM_CROP_DST;
-          transform_params.transform_filter = NvBufSurfTransformInter_Default;
-
-          /* Transformation format conversion, Transform rotated RGBA mat to NV12 memory in original input surface*/
-          err = NvBufSurfTransform (inter_buf, surface, &transform_params);
-          if (err != NvBufSurfTransformError_Success) {
-            std::cout<< "NvBufSurfTransform failed with error %d while converting buffer" << err <<std::endl;
-            return GST_PAD_PROBE_OK;
-          }
-
-          // access the surface modified by opencv
-          // cv::cvtColor(nv12_mat, rgba_mat, cv::COLOR_YUV2BGRA_NV12);
-          //dump the original NvbufSurface
-          NvBufSurfaceUnMap(inter_buf, 0, 0);
-          NvBufSurfaceUnMap(surface, 0, 0);
-          NvBufSurfaceDestroy(inter_buf);
-          cudaStreamDestroy(cuda_stream);
-#endif
         }
         else if(frame_meta->batch_id == 1){
           if (temp_ptr!=NULL){
@@ -658,7 +589,7 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
             temp_ptr = NULL;
           }
         }
-      if(!DEBUG_STAGE)
+      if(!DEBUG_STAGE && frame_number%100==0 && frame_meta->batch_id == 1)
         g_print ("PGIE: Frame Number = %d Number of objects = %d "
             "Vehicle Count = %d Person Count = %d\n",
             frame_meta->frame_num, num_rects, vehicle_count, person_count);
@@ -698,14 +629,18 @@ pgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
 // #endif
 
     }
+    frame_number++;
     gst_buffer_unmap (buf, &in_map_info);	
     return GST_PAD_PROBE_OK;
 }
 
 
 static GstPadProbeReturn
-sgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer ctx)
+sgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info,
+       gpointer ctx)
 {
+    static gint frame_number = 0;
+    static guint frame_count = 0;
     GstBuffer *buf = (GstBuffer *) info->data;
     // guint num_rects = 0; 
     NvDsObjectMeta *obj_meta = NULL;
@@ -835,9 +770,117 @@ sgie_src_pad_buffer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer ctx)
 }
 
 static GstPadProbeReturn
-osd_src_pad_buffer_probe  (GstPad * pad, GstPadProbeInfo * info,
+nvosd_src_pad_buffer_probe  (GstPad * pad, GstPadProbeInfo * info,
     gpointer u_data)
 {
+  static gint frame_number = 0;
+  static gint dump_count = 0;
+
+  GstBuffer *buf = (GstBuffer *) info->data;
+  guint num_rects = 0; 
+  NvDsObjectMeta *obj_meta = NULL;
+  guint vehicle_count = 0;
+  guint person_count = 0;
+  NvDsMetaList * l_frame = NULL;
+  NvDsMetaList * l_obj = NULL;
+  NvDsDisplayMeta *display_meta = NULL;
+
+  NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta (buf);
+
+  // Get original raw data
+  GstMapInfo in_map_info;
+  if (!gst_buffer_map (buf, &in_map_info, GST_MAP_READ)) {
+      g_print ("Error: Failed to map gst buffer\n");
+      gst_buffer_unmap (buf, &in_map_info);
+      return GST_PAD_PROBE_OK;
+  }
+  NvBufSurface *surface = (NvBufSurface *)in_map_info.data;
+  for (l_frame = batch_meta->frame_meta_list; l_frame != NULL;
+    l_frame = l_frame->next) {
+      NvDsFrameMeta *frame_meta = (NvDsFrameMeta *) (l_frame->data);
+      if(frame_meta->source_id == 0){
+      //TODO for cuda device memory we need to use cudamemcpy
+      NvBufSurfaceMap (surface, -1, -1, NVBUF_MAP_READ);
+      /* Cache the mapped data for CPU access */
+      NvBufSurfaceSyncForCpu (surface, 0, 0); //will do nothing for unified memory type on dGPU
+      guint surface_height = surface->surfaceList[frame_meta->source_id].height;
+      guint surface_width = surface->surfaceList[frame_meta->source_id].width;
+
+      //Create Mat from NvMM memory, refer opencv API for how to create a Mat
+      cv::Mat nv12_mat = cv::Mat(surface_height, surface_width, CV_8UC1, surface->surfaceList[frame_meta->source_id].mappedAddr.addr[0],
+      surface->surfaceList[frame_meta->source_id].pitch);
+      if(nv12_mat.empty()) return GST_PAD_PROBE_OK;
+      if(EVAL_MODE && dump_count <= MAX_DUMP_COUNT*10){
+        // char file_name[FILE_NAME_SIZE];
+        // sprintf(file_name, "record/all_stream%2d_%03d_3.png", frame_meta->source_id, frame_number);
+        auto now = std::chrono::system_clock::now();
+        auto duration = now.time_since_epoch();
+        auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+        std::string file_name = "record/all_stream_" + std::to_string(microseconds) + ".png";
+        std::string path_name = dump_path + file_name;
+        std::cout << "Image saved as " << path_name << std::endl;
+        cv::Mat dump_mat = nv12_mat.clone();
+        std::thread dump(dump_image, dump_mat, path_name);
+        dump.detach();
+      }
+
+    }
+      
+  }
+  NvBufSurfaceUnMap(surface, -1, -1);
+  gst_buffer_unmap(buf, &in_map_info);
+  frame_number++;
+  return GST_PAD_PROBE_OK;
+
+}
+
+static GstPadProbeReturn
+capfilter_src_pad_buffer_probe  (GstPad * pad, GstPadProbeInfo * info,
+    gpointer u_data)
+{
+  static gint frame_number = 0;
+  GstBuffer *buf = (GstBuffer *) info->data;
+  // NvDsBatchMeta *batch_meta = gst_buffer_get_nvds_batch_meta (buf);
+
+  // Get original raw data
+  GstMapInfo in_map_info;
+  if (!gst_buffer_map (buf, &in_map_info, GST_MAP_READ)) {
+      g_print ("Error: Failed to map gst buffer\n");
+      gst_buffer_unmap (buf, &in_map_info);
+      return GST_PAD_PROBE_OK;
+  }
+  NvBufSurface *surface = (NvBufSurface *)in_map_info.data;
+  /*
+  [[ 1.26349702e+00 -3.99308617e-03 -7.78615850e+01]
+ [-5.20580421e-03  1.17106447e+00 -5.84330899e+01]
+ [ 1.98392105e-06 -5.89803243e-05  1.00000000e+00]]
+  */
+  double kernel[3][3] = {{ 1.26349702e+00 ,-3.99308617e-03 ,-7.78615850e+01},
+                          {-5.20580421e-03,  1.17106447e+00, -5.84330899e+01},
+                          {1.98392105e-06 ,-5.89803243e-05 , 1.00000000e+00}};
+  cv::Mat H(3, 3, CV_64F, kernel);
+  for (uint32_t idx = 0; idx < surface->batchSize; idx++) {
+      //TODO for cuda device memory we need to use cudamemcpy
+      NvBufSurfaceMap (surface, -1, -1, NVBUF_MAP_READ_WRITE);
+      /* Cache the mapped data for CPU access */
+      NvBufSurfaceSyncForCpu (surface, 0, 0); //will do nothing for unified memory type on dGPU
+      guint surface_height = surface->surfaceList[idx].height;
+      guint surface_width = surface->surfaceList[idx].width;
+
+      //Create Mat from NvMM memory, refer opencv API for how to create a Mat
+      cv::Mat nv12_mat = cv::Mat(surface_height*3/2, surface_width, CV_8UC1, surface->surfaceList[idx].mappedAddr.addr[0],
+      surface->surfaceList[idx].pitch);
+      if(nv12_mat.empty()) return GST_PAD_PROBE_OK;
+
+      cv::Size dsize(surface_width, surface_height);
+      cv::warpPerspective(nv12_mat, nv12_mat, H, dsize, cv::INTER_NEAREST);
+      
+  }
+  NvBufSurfaceUnMap(surface, -1, -1);
+  gst_buffer_unmap(buf, &in_map_info);
+  frame_number++;
+  return GST_PAD_PROBE_OK;
+
 }
 
 static gboolean
@@ -954,6 +997,7 @@ create_http_bin (guint index, gchar * uri)
   /* Source element for reading from the uri.
    * We will use decodebin and let it figure out the container format of the
    * stream and the codec and plug the appropriate demux and decode plugins. */
+
   // if (PERF_MODE) {
   //   uri_decode_bin = gst_element_factory_make ("nvurisrcbin", "uri-decode-bin");
   //   g_object_set (G_OBJECT (uri_decode_bin), "file-loop", TRUE, NULL);
@@ -961,6 +1005,7 @@ create_http_bin (guint index, gchar * uri)
   // } else {
   //   uri_decode_bin = gst_element_factory_make ("uridecodebin", "uri-decode-bin");
   // }
+  
   souphttpsrc = gst_element_factory_make("souphttpsrc","soup-http-src");
   if (!bin || !souphttpsrc) {
     g_printerr ("One element in source bin could not be created.\n");
@@ -1047,7 +1092,7 @@ create_mjpg_bin (guint index, gchar * uri)
 {
   GstElement *bin = NULL, *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *videocrop1=NULL ,*videocrop2=NULL, *videoconvert1 = NULL,
      *videoconvert2 = NULL, *videoconvert3 = NULL, *nvvidconv1 = NULL, *nvvidconv2 = NULL, * jpegdec = NULL,*cap_filter1=NULL,*cap_filter2=NULL,
-     *cap_filter3=NULL, *cap_filter4=NULL, *decode_bin=NULL,*decode_bin2=NULL,*queue1=NULL,*queue2=NULL,*tee=NULL,*nvvidconv=NULL;
+     *cap_filter3=NULL, *cap_filter4=NULL, *decode_bin=NULL,*decode_bin2=NULL,*queue1=NULL,*queue2=NULL,*tee=NULL,*nvvidconv=NULL, *cap_filter3_queue=NULL, *cap_filter4_queue=NULL;
   GstCaps *caps1 = NULL,*caps2 = NULL,*caps3 = NULL,*caps4 = NULL;
   GstCapsFeatures *feature = NULL;
   gchar bin_name[16] = { };
@@ -1182,6 +1227,12 @@ create_mjpg_bin (guint index, gchar * uri)
   g_object_set(G_OBJECT(cap_filter3), "caps", caps3, NULL);
   gst_caps_unref(caps3);
 
+  cap_filter3_queue = gst_element_factory_make ("queue", "cap_filte3_queue");
+  if (!cap_filter3) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filte3_queue");
+    return NULL;
+  }
+
   cap_filter4 = gst_element_factory_make ("capsfilter", "cap_filte4_nvvidconv");
   if (!cap_filter4) {
     NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filter4");
@@ -1189,9 +1240,26 @@ create_mjpg_bin (guint index, gchar * uri)
   }
   g_object_set(G_OBJECT(cap_filter4), "caps", caps4, NULL);
   gst_caps_unref(caps4);
+  
+  cap_filter4_queue = gst_element_factory_make ("queue", "cap_filte4_queue");
+  if (!cap_filter4_queue) {
+    NVGSTDS_ERR_MSG_V ("Failed to create '%s'", "cap_filte4_queue");
+    return NULL;
+  }
+if(1){
+  GstPad *cap_filter3_src_pad=NULL;
+  cap_filter3_src_pad = gst_element_get_static_pad (cap_filter3, "src");
+  if (!cap_filter3_src_pad)
+    g_print ("Unable to get src pad\n");
+  else
+    gst_pad_add_probe (cap_filter3_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        capfilter_src_pad_buffer_probe, (gpointer) NULL, NULL);
+  gst_object_unref (cap_filter3_src_pad);
+
+}
 
   gst_bin_add_many (GST_BIN (bin), v4l2src, jpegdec, srctee, srcqueue1, srcqueue2, videocrop1, videocrop2,
-  videoconvert1, nvvidconv1, nvvidconv2,  cap_filter1, cap_filter2, cap_filter3,cap_filter4, NULL); //decode_bin,,queue2,queue1,tee,
+  videoconvert1, nvvidconv1, nvvidconv2,  cap_filter1, cap_filter2, cap_filter3,cap_filter4,cap_filter3_queue,cap_filter4_queue, NULL); //decode_bin,,queue2,queue1,tee,
 
 
   if (!gst_element_link_many(v4l2src, cap_filter1, jpegdec, videoconvert1, NULL)) {
@@ -1202,12 +1270,12 @@ create_mjpg_bin (guint index, gchar * uri)
         g_printerr("Failed to link videoconvert1, and tee.\n");
         return NULL;
     }
-  if (!gst_element_link_many(srcqueue1, videocrop1,  nvvidconv1, cap_filter3, NULL)) {
+  if (!gst_element_link_many(srcqueue1, videocrop1,  nvvidconv1, cap_filter3, cap_filter3_queue, NULL)) {
       g_printerr("Failed to link first branch.\n");
       return NULL;
   }
 
-  if (!gst_element_link_many(srcqueue2, videocrop2, nvvidconv2, cap_filter4, NULL)) {
+  if (!gst_element_link_many(srcqueue2, videocrop2, nvvidconv2, cap_filter4, cap_filter4_queue,NULL)) {
       g_printerr("Failed to link second branch.\n");
       return NULL;
   }
@@ -1236,8 +1304,8 @@ create_mjpg_bin (guint index, gchar * uri)
    * now. Once the decode bin creates the video decoder and generates the
    * cb_newpad callback, we will set the ghost pad target to the video decoder
    * src pad. */
-  GstPad *gstpad1 = gst_element_get_static_pad (cap_filter3, "src");
-  GstPad *gstpad2 = gst_element_get_static_pad (cap_filter4, "src");
+  GstPad *gstpad1 = gst_element_get_static_pad (cap_filter3_queue, "src");
+  GstPad *gstpad2 = gst_element_get_static_pad (cap_filter4_queue, "src");
 
   if (!gst_element_add_pad (bin, gst_ghost_pad_new ("src1",
               gstpad1))) {
@@ -1472,35 +1540,43 @@ main (int argc, char *argv[])
              *nvosd = NULL, 
              *tiler = NULL, 
              *nvdslogger = NULL,
-             *streamux_queue, 
-             *pgie_queue_b0, 
-             *pgie_queue_b1, 
-             *sgie_queue,  
-             *metamuxer_queue,
-             *postprocess_queue, 
-             *tiler_queue, 
-             *nvvidconv_queue, 
-             *videotemplate_queue, 
-             *nvosd_queue;
+             *nvdslogger_queue = NULL,
+             *streamux_queue = NULL, 
+             *pgie_queue_b0 = NULL, 
+             *pgie_queue_b1 = NULL, 
+             *streammux_queue_b0 = NULL, 
+             *streammux_queue_b1 = NULL, 
+             *sgie_queue = NULL,  
+             *metamuxer_queue = NULL,
+             *postprocess_queue = NULL, 
+             *tiler_queue = NULL, 
+             *nvvidconv_queue = NULL, 
+             *videotemplate_queue = NULL, 
+             *nvosd_queue = NULL;
               
   GstBus *bus = NULL;
   guint bus_watch_id;
-  GstPad *tiler_src_pad = NULL, *pgie_src_pad = NULL, *sgie_src_pad = NULL, *osd_src_pad = NULL;
+  GstPad *tiler_src_pad = NULL, *pgie_src_pad = NULL, *sgie_src_pad = NULL, *nvosd_src_pad = NULL;
   guint i =0, num_sources = 0;
   guint tiler_rows, tiler_columns;
   guint pgie_batch_size, sgie_batch_size;
   gboolean yaml_config = FALSE;
   NvDsGieType pgie_type = NVDS_GIE_PLUGIN_INFER;
   NvDsGieType sgie_type = NVDS_GIE_PLUGIN_INFER;
-
-  PERF_MODE = g_getenv("NVDS_TEST3_PERF_MODE") &&
-      !g_strcmp0(g_getenv("NVDS_TEST3_PERF_MODE"), "1");
-  USE_POSTPROCESS = g_getenv("NVDS_TEST3_USE_POSTPROCESS") &&
-      !g_strcmp0(g_getenv("NVDS_TEST3_USE_POSTPROCESS"), "1");
-  USE_SGIE = g_getenv("NVDS_TEST3_USE_SGIE") &&
-      !g_strcmp0(g_getenv("NVDS_TEST3_USE_SGIE"), "1");
-  USE_VIDEOTEMP = g_getenv("NVDS_TEST3_USE_VIDEOTEMP") &&
-      !g_strcmp0(g_getenv("NVDS_TEST3_USE_VIDEOTEMP"), "1");
+  RELEASE_MODE = g_getenv("NVDS_RELEASE_MODE") &&
+      !g_strcmp0(g_getenv("NVDS_RELEASE_MODE"), "1");
+  EVAL_MODE = g_getenv("NVDS_EVAL_MODE") &&
+      !g_strcmp0(g_getenv("NVDS_EVAL_MODE"), "1");
+  PERF_MODE = g_getenv("NVDS_PERF_MODE") &&
+      !g_strcmp0(g_getenv("NVDS_PERF_MODE"), "1");
+  USE_POSTPROCESS = g_getenv("NVDS_USE_POSTPROCESS") &&
+      !g_strcmp0(g_getenv("NVDS_USE_POSTPROCESS"), "1");
+  USE_SGIE = g_getenv("NVDS_USE_SGIE") &&
+      !g_strcmp0(g_getenv("NVDS_USE_SGIE"), "1");
+  USE_VIDEOTEMP = g_getenv("NVDS_USE_VIDEOTEMP") &&
+      !g_strcmp0(g_getenv("NVDS_USE_VIDEOTEMP"), "1");
+  USE_DRMSINK = g_getenv("NVDS_USE_DRMSINK") &&
+      !g_strcmp0(g_getenv("NVDS_USE_DRMSINK"), "1");
   int current_device = -1;
   cudaGetDevice(&current_device);
   struct cudaDeviceProp prop;
@@ -1896,9 +1972,9 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
     }
   }
 
-    if (yaml_config) {
-      g_list_free(src_list);
-    }
+  if (yaml_config) {
+    g_list_free(src_list);
+  }
   // preprocess0 = gst_element_factory_make ("nvdspreprocess", "preprocess0");
   // preprocess1 = gst_element_factory_make ("nvdspreprocess", "preprocess1");
 
@@ -1944,6 +2020,9 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
     videotemplate_queue = gst_element_factory_make ("queue", "videotemplate_queue");
   }
 
+  streammux_queue_b0      = gst_element_factory_make ("queue", "streammux_queue_0");
+  streammux_queue_b1      = gst_element_factory_make ("queue", "streammux_queue_1");
+
   pgie_queue_b0      = gst_element_factory_make ("queue", "pgie_queue_0");
   pgie_queue_b1      = gst_element_factory_make ("queue", "pgie_queue_1");
   
@@ -1954,7 +2033,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   nvosd_queue     = gst_element_factory_make ("queue", "nvosd_queue");
   /* Use nvdslogger for perf measurement. */
   nvdslogger = gst_element_factory_make ("nvdslogger", "nvdslogger");
-
+  nvdslogger_queue = gst_element_factory_make ("queue", "nvdslogger_queue");
   /* Use nvtiler to composite the batched frames into a 2D tiled array based
    * on the source of the frames. */
   tiler = gst_element_factory_make ("nvmultistreamtiler", "nvtiler");
@@ -1969,7 +2048,11 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
     sink = gst_element_factory_make ("fakesink", "nvvideo-renderer");
   } else {
     /* Finally render the osd output */
-    if(prop.integrated) {
+    if(USE_DRMSINK){
+      g_print("use nvdrmvideosink!\n");
+      sink = gst_element_factory_make ("nvdrmvideosink", "nvdrmvideo-sink");
+    }
+    else if(prop.integrated) {
       sink = gst_element_factory_make ("nv3dsink", "nv3d-sink");
     } else {
       sink = gst_element_factory_make ("nveglglessink", "nvvideo-renderer");
@@ -2003,7 +2086,6 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
       g_object_set (G_OBJECT (videotemplate), "customlib-props", "add-fusion-surface:0", NULL);
 
     }
-  
 
     RETURN_ON_PARSER_ERROR(nvds_parse_gie(pgie_b0, argv[1], "primary-gie-0"));
     RETURN_ON_PARSER_ERROR(nvds_parse_gie(pgie_b1, argv[1], "primary-gie-1"));
@@ -2041,7 +2123,17 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
     if (PERF_MODE) {
         RETURN_ON_PARSER_ERROR(nvds_parse_fake_sink(sink, argv[1], "sink"));
     } else {
-      if(prop.integrated) {
+      if(USE_DRMSINK){
+        g_print("use nvdrmvideosink!");
+    // g_object_set(G_OBJECT(sink), "conn_id", 0, NULL);
+    // g_object_set(G_OBJECT(sink), "plane_id", 1, NULL);
+      g_object_set(G_OBJECT(sink), "set_mode", 1, NULL);
+      g_object_set(G_OBJECT(sink), "sync", false, NULL);
+
+    // g_object_set (G_OBJECT (sink), "qos", 0, "type", 1 ,NULL);
+
+      }
+      else if(prop.integrated) {
         RETURN_ON_PARSER_ERROR(nvds_parse_3d_sink(sink, argv[1], "sink"));
       } else {
         RETURN_ON_PARSER_ERROR(nvds_parse_egl_sink(sink, argv[1], "sink"));
@@ -2107,7 +2199,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   // 
   // videotemplate, videotemplate_queue,
   gst_bin_add_many (GST_BIN (pipeline), streamux_queue, streamdemux, tee_b0, tee_b1, tee0_queue_b0, tee0_queue_b1, tee1_queue_b0, tee1_queue_b1, 
-      streammux_b0, streammux_b1, pgie_b0, pgie_queue_b0, pgie_b1, pgie_queue_b1, metamuxer,  metamuxer_queue, nvdslogger, tiler,
+      streammux_b0, streammux_queue_b0, streammux_b1, streammux_queue_b1, pgie_b0, pgie_queue_b0, pgie_b1, pgie_queue_b1, metamuxer,  metamuxer_queue, nvdslogger,nvdslogger_queue, tiler,
       tiler_queue, nvvidconv, nvvidconv_queue, nvosd, nvosd_queue, sink, NULL);
   /* we link the elements together
   * source0 -> \ 
@@ -2115,7 +2207,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   if (USE_SGIE && USE_POSTPROCESS){
     gst_bin_add_many (GST_BIN (pipeline),sgie, sgie_queue, postprocess, postprocess_queue, NULL);
     if (!gst_element_link_many (streammux, streamux_queue, pgie_b0, pgie_queue_b0, sgie, sgie_queue, postprocess, postprocess_queue, 
-                               nvvidconv, nvvidconv_queue, videotemplate, videotemplate_queue, nvdslogger, tiler, tiler_queue, 
+                               nvvidconv, nvvidconv_queue, videotemplate, videotemplate_queue, nvdslogger,nvdslogger_queue, tiler, tiler_queue, 
                               nvosd, nvosd_queue, sink, NULL)) {
     g_printerr ("Elements could not be linked. Exiting.\n");
     return -1;
@@ -2124,7 +2216,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   else if(USE_SGIE){
     gst_bin_add_many (GST_BIN (pipeline),sgie, sgie_queue, NULL);
     if (!gst_element_link_many (streammux, streamux_queue, pgie_b0, pgie_queue_b0, sgie, sgie_queue,
-                               nvvidconv, nvvidconv_queue, nvdslogger, tiler, tiler_queue, 
+                               nvvidconv, nvvidconv_queue, nvdslogger,nvdslogger_queue, tiler, tiler_queue, 
                               nvosd, nvosd_queue, sink, NULL)) {
     g_printerr ("Elements could not be linked. Exiting.\n");
     return -1;
@@ -2133,7 +2225,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   else if (USE_POSTPROCESS){
     gst_bin_add_many (GST_BIN (pipeline), postprocess, postprocess_queue, NULL);
     if (!gst_element_link_many (streammux, streamux_queue, pgie_b0, pgie_queue_b0, postprocess, postprocess_queue, 
-                               nvvidconv, nvvidconv_queue, nvdslogger, tiler, tiler_queue, 
+                               nvvidconv, nvvidconv_queue, nvdslogger,nvdslogger_queue, tiler, tiler_queue, 
                               nvosd, nvosd_queue, sink, NULL)) {
     g_printerr ("Elements could not be linked. Exiting.\n");
     return -1;
@@ -2142,7 +2234,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   else if(USE_VIDEOTEMP){
     gst_bin_add_many (GST_BIN (pipeline), videotemplate, videotemplate_queue, NULL);
     if (!gst_element_link_many (streammux, streamux_queue, pgie_b0, pgie_queue_b0,  
-                            nvvidconv, nvvidconv_queue, videotemplate, videotemplate_queue, nvdslogger, tiler, tiler_queue, 
+                            nvvidconv, nvvidconv_queue, videotemplate, videotemplate_queue,nvdslogger_queue, nvdslogger, tiler, tiler_queue, 
                           nvosd, nvosd_queue, sink, NULL)) {
     g_printerr ("Elements could not be linked. Exiting.\n");
     return -1;
@@ -2159,7 +2251,7 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
       g_printerr ("Elements queue1 to streamdemux could not be linked. Exiting.\n");
       return -1;
     }
-    /*----------------------------link streamdemux to tee and queue in different branch----------------------------------------------*/
+    /* link streamdemux to tee and queue in different branch */
     // branch0
     link_element_to_demux_src_pad(streamdemux, tee_b0, 0);
     link_element_to_tee_src_pad (tee_b0, tee0_queue_b0);
@@ -2170,31 +2262,31 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
     link_element_to_tee_src_pad (tee_b1, tee1_queue_b0);
     link_element_to_tee_src_pad (tee_b1, tee1_queue_b1);
 
-    /*----------------------------link streamdemux to tee and queue in different branch----------------------------------------------*/
+    /* link streamdemux to tee and queue in different branch */
 
-    /*----------------------------link  different queue to one streammux in different branch----------------------------------------------*/
+    /* link  different queue to one streammux in different branch */
     // branch0
     link_element_to_streammux_sink_pad (streammux_b0, tee0_queue_b0, 0);
     link_element_to_streammux_sink_pad (streammux_b0, tee1_queue_b0, 1);
     //branch1
     link_element_to_streammux_sink_pad (streammux_b1, tee0_queue_b1, 0);
     link_element_to_streammux_sink_pad (streammux_b1, tee1_queue_b1, 1);
-    /*----------------------------link  different queue to one streammux in different branch----------------------------------------------*/
+    /* link  different queue to one streammux in different branch */
 
-    /*----------------------------link streammux to pgie in different branch----------------------------------------------*/
-    if (!gst_element_link (streammux_b0, pgie_b0))
+    /* link streammux to pgie in different branch */
+    if (!gst_element_link_many (streammux_b0, streammux_queue_b0, pgie_b0, pgie_queue_b0,NULL))
     {
       g_printerr ("Elements streammux_b0 to pgie_b0 could not be linked. Exiting.\n");
       return -1;
     }
-    if (!gst_element_link (streammux_b1, pgie_b1))
+    if (!gst_element_link_many (streammux_b1, streammux_queue_b1, pgie_b1, pgie_queue_b1,NULL))
     {
-      g_printerr ("Elements streammux_b0 to pgie_b0 could not be linked. Exiting.\n");
+      g_printerr ("Elements streammux_b1 to pgie_b1 could not be linked. Exiting.\n");
       return -1;
     }
 
-    link_element_to_metamux_sink_pad (metamuxer, pgie_b0, 0);
-    link_element_to_metamux_sink_pad (metamuxer, pgie_b1, 1);
+    link_element_to_metamux_sink_pad (metamuxer, pgie_queue_b0, 0);
+    link_element_to_metamux_sink_pad (metamuxer, pgie_queue_b1, 1);
     if (!gst_element_link (metamuxer, metamuxer_queue))
     {
       g_printerr ("Elements metamuxer to queue2 could not be linked. Exiting.\n");
@@ -2203,21 +2295,12 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
 
 
     if (!gst_element_link_many ( metamuxer_queue,
-                            nvvidconv, nvvidconv_queue, nvdslogger, tiler, tiler_queue, 
+                            nvvidconv, nvvidconv_queue, nvdslogger, nvdslogger_queue, tiler, tiler_queue, 
                           nvosd, nvosd_queue, sink, NULL)) {
     g_printerr ("Elements could not be linked. Exiting.\n");
     return -1;
     }
   }
-  // else{
-  //   if (!gst_element_link_many (streammux, streamux_queue, pgie, pgie_queue,  
-  //                       nvvidconv, nvvidconv_queue, nvdslogger, tiler, tiler_queue, 
-  //                     nvosd, nvosd_queue, sink, NULL)) {
-  //   g_printerr ("Elements could not be linked. Exiting.\n");
-  //   return -1;
-  //   }
-  // }
-  
 
   /* Lets add probe to get informed of the meta data generated, we add probe to
    * the sink pad of the osd element, since by that time, the buffer would have
@@ -2240,6 +2323,19 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
         pgie_src_pad_buffer_probe, (gpointer) NULL, NULL);
   gst_object_unref (pgie_src_pad);
 
+if(EVAL_MODE){
+    nvosd_src_pad = gst_element_get_static_pad (nvosd, "src");
+  if (!nvosd_src_pad)
+    g_print ("Unable to get src pad\n");
+  else
+    gst_pad_add_probe (nvosd_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
+        nvosd_src_pad_buffer_probe, (gpointer) NULL, NULL);
+  gst_object_unref (nvosd_src_pad);
+
+}
+
+
+  
   // if(USE_SGIE){
   //   sgie_src_pad = gst_element_get_static_pad (sgie, "src");
   //   if (!sgie_src_pad)
@@ -2249,14 +2345,8 @@ GstElement *v4l2src = NULL, *srctee=NULL, *srcqueue1=NULL, *srcqueue2=NULL, *vid
   //         sgie_src_pad_buffer_probe, NULL, NULL);
   //   gst_object_unref (sgie_src_pad);
   // }
-  osd_src_pad = gst_element_get_static_pad (nvosd, "src");
-  // NvDsObjEncCtxHandle obj_ctx_handle = nvds_obj_enc_create_context (0);
-  if (!osd_src_pad)
-    g_print ("Unable to get src pad\n");
-  else
-    gst_pad_add_probe (osd_src_pad, GST_PAD_PROBE_TYPE_BUFFER,
-        osd_src_pad_buffer_probe, (gpointer) NULL, NULL);
-  gst_object_unref (osd_src_pad);
+
+
 
   std::thread sock_recesive_thread(sock_recesive);
   std::thread handle_press_thread(handle_button_press, std::ref(maxAngleVal), std::ref(angleIndex));

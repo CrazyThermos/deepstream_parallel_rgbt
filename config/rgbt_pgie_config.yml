@@ -60,7 +60,7 @@
 property:
   # gpu-id: 0
   net-scale-factor: 0.0039215697906911373
-  model-engine-file: ../engine/rgbt_yolov5_m3fd_debug_b2_op13_one_input.engine
+  model-engine-file: ../engine/rgbt_ca_rtdetrv2_ours_add_op15_oneinput_fp16.engine
   labelfile-path: labels.txt
 
   network-mode: 2
@@ -80,6 +80,6 @@ property:
   crop-objects-to-roi-boundary: 1
 
 class-attrs-all:
-  pre-cluster-threshold: 0.35
+  pre-cluster-threshold: 0.25
   topk: 100
   nms-iou-threshold: 0.5

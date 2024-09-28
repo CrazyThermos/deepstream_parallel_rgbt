@@ -74,16 +74,24 @@ LIBS+= -L/usr/local/cuda-$(CUDA_VER)/lib64/ -lcudart -lnvdsgst_helper -lgstrtsps
 ifeq ($(WITH_OPENCV),1)
  LIBS+= -lopencv_imgproc -lopencv_core -lopencv_imgcodecs
 endif
+
+
 all: $(APP)
 
+debug: CFLAGS+= -g
+debug: $(APP)
+
+release: CFLAGS+= -O3
+release: $(APP)
+
 %.o: %.c $(INCS) Makefile
-	$(CC) -c -g -o $@ $(CFLAGS) $<
+	$(CC) -c -o $@ $(CFLAGS) $<
 
 %.o: %.cpp $(INCS) Makefile
-	$(CXX) -c -g -o $@ $(CFLAGS) $<
+	$(CXX) -c -o $@ $(CFLAGS) $<
 
 $(APP): $(OBJS) Makefile
-	$(CXX) -g -o $(APP) $(OBJS) $(LIBS)
+	$(CXX) -o $(APP) $(OBJS) $(LIBS)
 
 install: $(APP)
 	cp -rv $(APP) $(APP_INSTALL_DIR)

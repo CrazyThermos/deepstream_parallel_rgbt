@@ -13,4 +13,6 @@ _deps
 *.png
 *.dot
 *.pdf
+*.engine
+
 bug.txt

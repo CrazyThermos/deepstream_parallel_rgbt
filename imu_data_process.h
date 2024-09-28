@@ -103,6 +103,7 @@ void sock_recesive()
   printf("client %s has connnected\n", inet_ntoa(client_addr.sin_addr));
 
 // 3. 接收来自Python程序的数据
+    long long count=0;
     char buffer[1024]={0};
     while(1){
 
@@ -138,9 +139,11 @@ void sock_recesive()
             // 发送响应给Python程序
             const char* response = "Data received successfully!";
             send(sock_client, response, strlen(response), 0);
-        } else {
-            printf("Failed to receive data from Python program.");
-        }
+        } 
+        // else {
+        //     if(count % 1000 == 0) printf("Failed to receive data from Python program.");
+        // }
+        count++;
     }
 
     // 关闭连接

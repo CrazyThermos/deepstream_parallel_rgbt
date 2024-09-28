@@ -60,7 +60,7 @@
 property:
   # gpu-id: 0
   net-scale-factor: 0.0039215697906911373
-  model-engine-file: /workspace/yuhang/trt_scripts/engine/fusion_y_384x512_fp16.engine
+  model-engine-file: ../engine/fusion_y_384x512_fp16.engine
   network-mode: 2
   network-type: 100
   network-input-order: 0

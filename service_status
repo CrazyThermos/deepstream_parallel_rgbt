@@ -1,0 +1,5 @@
+sudo systemctl daemon-reload
+sudo systemctl enable deepstream.service
+sudo systemctl start deepstream.service
+sudo systemctl status deepstream.service
+journalctl -u deepstream.service -b
