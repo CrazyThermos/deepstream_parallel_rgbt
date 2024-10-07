@@ -1,1 +1,0 @@
-./deepstream-parallel-app ./config/deepstream_rgbt_config.yml

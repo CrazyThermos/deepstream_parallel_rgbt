@@ -8,7 +8,7 @@ declare -a filenames=("pipeline-media-type" "pipeline-caps-details" "pipeline-no
  
 for filename in "${filenames[@]}"
 do
-  dot -Tpdf "${filename}.dot" > "${filename}.pdf"
-  dot -Tjpg "${filename}.dot" > "${filename}.jpg"
+  # dot -Tpdf "${filename}.dot" > "${filename}.pdf"
+  # dot -Tjpg "${filename}.dot" > "${filename}.jpg"
   dot -Tpng "${filename}.dot" > "${filename}.png"
 done

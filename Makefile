@@ -53,7 +53,7 @@ CFLAGS+= -I../../../includes \
 		 -I /usr/include/glib-2.0 \
 		 -I /usr/include/c++/9 \
 		 -I/usr/include/aarch64-linux-gnu/c++/9/ \
-		 -I./ -I../../apps-common/includes \
+		 -I./ \
 		 -I /usr/lib/aarch64-linux-gnu/glib-2.0/include \
 		 -I /usr/local/cuda-$(CUDA_VER)/include \
 		 -I /usr/include/opencv4
@@ -68,22 +68,30 @@ LIBS:= $(shell pkg-config --libs $(PKGS))
 LIBS+= -L/usr/local/cuda-$(CUDA_VER)/lib64/ -lcudart -lnvdsgst_helper -lgstrtspserver-1.0 -lm \
 		-L$(LIB_INSTALL_DIR) -lnvdsgst_meta -lnvds_meta -lnvds_yml_parser -lyaml-cpp -lnvds_msgbroker\
 		-L/opt/nvidia/deepstream/deepstream/lib/cvcore_libs/ -lnvdsgst_smartrecord\
-		-lnvds_batch_jpegenc -lnvbufsurface -lnvbufsurftransform -lnvcv_core \
+		-lnvds_batch_jpegenc -lnvbufsurface -lnvbufsurftransform -lnvcv_core -lpthread -lJetsonGPIO\
 		-lcuda -ldl -Wl,-rpath,$(LIB_INSTALL_DIR)
 
 ifeq ($(WITH_OPENCV),1)
  LIBS+= -lopencv_imgproc -lopencv_core -lopencv_imgcodecs
 endif
+
+
 all: $(APP)
 
+debug: CFLAGS+= -g
+debug: $(APP)
+
+release: CFLAGS+= -O3
+release: $(APP)
+
 %.o: %.c $(INCS) Makefile
-	$(CC) -c -g -o $@ $(CFLAGS) $<
+	$(CC) -c -o $@ $(CFLAGS) $<
 
 %.o: %.cpp $(INCS) Makefile
-	$(CXX) -c -g -o $@ $(CFLAGS) $<
+	$(CXX) -c -o $@ $(CFLAGS) $<
 
 $(APP): $(OBJS) Makefile
-	$(CXX) -g -o $(APP) $(OBJS) $(LIBS)
+	$(CXX) -o $(APP) $(OBJS) $(LIBS)
 
 install: $(APP)
 	cp -rv $(APP) $(APP_INSTALL_DIR)
